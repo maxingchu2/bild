@@ -7,9 +7,9 @@ from fastapi import FastAPI
 from fastapi.responses import HTMLResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
-UPSTREAM_URL = os.getenv("UPSTREAM_URL", "http://172.30.55.2:8040/v1/chat/completions")
-API_KEY = os.getenv("UPSTREAM_API_KEY", "sk-qwen35-vl-ccs-zjxy-666")
-MODEL = os.getenv("UPSTREAM_MODEL", "/data/models/Qwen3.5-27B_chuanjishe_7.1_v3_fixed")
+UPSTREAM_URL = os.getenv("UPSTREAM_URL", "https://api.deepseek.com/v1/chat/completions")
+API_KEY = os.getenv("UPSTREAM_API_KEY", "sk-e76068d4dd5f4da9a8da51094ff09d91")
+MODEL = os.getenv("UPSTREAM_MODEL", "deepseek-v4-flash")
 
 app = FastAPI(title="多轮对话助手")
 
@@ -54,9 +54,13 @@ async def stream_upstream(req: ChatRequest) -> AsyncGenerator[str, None]:
                         break
                     try:
                         chunk = json.loads(data)
-                        delta = chunk["choices"][0]["delta"].get("content") or ""
+                        d = chunk["choices"][0]["delta"]
+                        delta = d.get("content") or ""
+                        reasoning = d.get("reasoning_content") or ""
                     except (json.JSONDecodeError, KeyError, IndexError):
                         continue
+                    if reasoning:
+                        yield f"data: {json.dumps({'reasoning': reasoning}, ensure_ascii=False)}\n\n"
                     if delta:
                         yield f"data: {json.dumps({'content': delta}, ensure_ascii=False)}\n\n"
     except httpx.HTTPError as e:

@@ -23,6 +23,7 @@
   .bubble table { border-collapse: collapse; }
   .bubble th, .bubble td { border: 1px solid #d1d5db; padding: 4px 8px; }
   .error { color: #dc2626; }
+  .reasoning { color: #6b7280; font-size: 13px; border-left: 3px solid #d1d5db; padding-left: 8px; margin-bottom: 8px; white-space: pre-wrap; }
   footer { padding: 12px 20px; background: #fff; border-top: 1px solid #e5e7eb; }
   form { max-width: 860px; margin: 0 auto; display: flex; gap: 8px; }
   textarea { flex: 1; resize: none; border: 1px solid #d1d5db; border-radius: 8px; padding: 10px; font-size: 14px; font-family: inherit; height: 48px; }
@@ -68,6 +69,10 @@ async function send(text) {
   sendBtn.disabled = true;
 
   let full = '';
+  let reasoning = '';
+  const reasoningEl = document.createElement('div');
+  reasoningEl.className = 'reasoning';
+  const contentEl = document.createElement('div');
   try {
     const resp = await fetch('/api/chat', {
       method: 'POST',
@@ -93,8 +98,19 @@ async function send(text) {
           bubble.innerHTML += '<div class="error">' + obj.error + '</div>';
           continue;
         }
-        full += obj.content || '';
-        bubble.innerHTML = marked.parse(full);
+        if (bubble.textContent === '…') {
+          bubble.textContent = '';
+          bubble.appendChild(reasoningEl);
+          bubble.appendChild(contentEl);
+        }
+        if (obj.reasoning) {
+          reasoning += obj.reasoning;
+          reasoningEl.textContent = reasoning;
+        }
+        if (obj.content) {
+          full += obj.content;
+          contentEl.innerHTML = marked.parse(full);
+        }
         chatEl.scrollTop = chatEl.scrollHeight;
       }
     }
