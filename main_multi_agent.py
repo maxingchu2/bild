@@ -247,8 +247,8 @@ async def supervisor_node(state: AgentState):
     response = await llm.ainvoke(messages)
     text = response.content if isinstance(response.content, str) else str(response.content)
     next_agent = "general_agent"
-    for name in AGENTS:
-        if name in text:
+    for name, cfg in AGENTS.items():
+        if name in text or cfg["描述"].split("：")[0] in text:
             next_agent = name
             break
     return {"next_agent": next_agent}
@@ -370,7 +370,11 @@ async def list_agents():
 
 
 @app.get("/ship", response_class=HTMLResponse)
-async def ship_page():
+@app.get("/login", response_class=HTMLResponse)
+@app.get("/assistant", response_class=HTMLResponse)
+@app.get("/preparations/{_path:path}", response_class=HTMLResponse)
+@app.get("/archives/{_path:path}", response_class=HTMLResponse)
+async def ship_page(_path: str = ""):
     html_path = os.path.join(os.path.dirname(__file__), "static", "ship-inspection.html")
     with open(html_path, encoding="utf-8") as f:
         return f.read()
