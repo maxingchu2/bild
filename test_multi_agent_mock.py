@@ -15,7 +15,7 @@ class FakeRouter:
         self.target = target
 
     async def ainvoke(self, messages):
-        return m.Route(next_agent=self.target)
+        return AIMessage(content=self.target)
 
 
 class FakeAgentLLM:
@@ -34,7 +34,7 @@ class FakeAgentLLM:
 
 
 async def run_case(router_target, tool_name, args, question):
-    m.router_llm = FakeRouter(router_target)
+    m.llm = FakeRouter(router_target)
     fake = FakeAgentLLM(tool_name, args)
     cfg = m.AGENTS[router_target]
     state = {"messages": [HumanMessage(content=question)], "next_agent": ""}

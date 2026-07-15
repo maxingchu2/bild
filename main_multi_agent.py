@@ -18,6 +18,7 @@ import os
 from typing import AsyncGenerator, Literal
 
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, StreamingResponse
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from langchain_core.tools import tool
@@ -31,6 +32,12 @@ API_KEY = os.getenv("UPSTREAM_API_KEY", "sk-e76068d4dd5f4da9a8da51094ff09d91")
 MODEL = os.getenv("UPSTREAM_MODEL", "deepseek-v4-flash")
 
 app = FastAPI(title="船舶检验多智能体")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 llm = ChatOpenAI(base_url=BASE_URL, api_key=API_KEY, model=MODEL, streaming=True)
 
@@ -60,6 +67,40 @@ SHIPS = {
             {"编号": 1, "名称": "主机运行状态检查", "类别": "主机系统"},
             {"编号": 2, "名称": "舵机密封检查", "类别": "舵机系统"},
         ],
+        "遗留复查项": [],
+    },
+    "MV PACIFIC STAR": {
+        "CCSNO": "9876543", "船舶类型": "散货船 (Bulk Carrier)", "建造日期": "2025-04-11",
+        "检验类型": "年度检验", "状态": "待检验前准备",
+        "检验项": [
+            {"编号": "SC-205", "名称": "救生艇及降落装置", "类别": "救生设备"},
+            {"编号": "SC-212", "名称": "救生圈及自亮灯", "类别": "救生设备"},
+            {"编号": "FC-119", "名称": "应急消防泵压力检查", "类别": "消防设备"},
+            {"编号": "FC-121", "名称": "火灾探测器功能试验", "类别": "消防设备"},
+            {"编号": "HK-301", "名称": "外板腐蚀测厚", "类别": "外板测厚"},
+        ],
+        "遗留复查项": [
+            {"编号": "FC-119", "问题": "应急消防泵压力不足", "状态": "未确认"},
+            {"编号": "HK-301", "问题": "船体板厚局部减薄", "状态": "未确认"},
+            {"编号": "ME-40", "问题": "舵机密封渗漏", "状态": "未确认"},
+        ],
+    },
+    "MV OCEAN PIONEER": {
+        "CCSNO": "8765432", "船舶类型": "散货船 (Bulk Carrier)", "建造日期": "2020-08-15",
+        "检验类型": "年度检验", "状态": "待归档",
+        "检验项": [
+            {"编号": "SC-201", "名称": "救生艇释放装置检查", "类别": "救生设备"},
+            {"编号": "FC-118", "名称": "消防主管线检查", "类别": "消防设备"},
+        ],
+        "遗留复查项": [
+            {"编号": "Q-001", "问题": "救生艇释放装置卡滞", "状态": "未确认"},
+            {"编号": "Q-002", "问题": "消防主管线腐蚀", "状态": "未确认"},
+        ],
+    },
+    "MV ATLANTIC VOYAGER": {
+        "CCSNO": "7654321", "船舶类型": "集装箱船", "建造日期": "2019-03-22",
+        "检验类型": "特别检验", "状态": "已完成",
+        "检验项": [],
         "遗留复查项": [],
     },
 }
@@ -201,13 +242,16 @@ class Route(BaseModel):
     )
 
 
-router_llm = llm.with_structured_output(Route)
-
-
 async def supervisor_node(state: AgentState):
     messages = [SystemMessage(content=ROUTER_PROMPT)] + state["messages"]
-    route = await router_llm.ainvoke(messages)
-    return {"next_agent": route.next_agent}
+    response = await llm.ainvoke(messages)
+    text = response.content if isinstance(response.content, str) else str(response.content)
+    next_agent = "general_agent"
+    for name in AGENTS:
+        if name in text:
+            next_agent = name
+            break
+    return {"next_agent": next_agent}
 
 
 def make_agent_node(name: str):
@@ -323,6 +367,13 @@ async def chat(req: ChatRequest):
 @app.get("/api/agents")
 async def list_agents():
     return {name: cfg["描述"] for name, cfg in AGENTS.items()}
+
+
+@app.get("/ship", response_class=HTMLResponse)
+async def ship_page():
+    html_path = os.path.join(os.path.dirname(__file__), "static", "ship-inspection.html")
+    with open(html_path, encoding="utf-8") as f:
+        return f.read()
 
 
 @app.get("/", response_class=HTMLResponse)
