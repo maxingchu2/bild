@@ -232,7 +232,9 @@ class AgentState(MessagesState):
 ROUTER_PROMPT = (
     "你是船舶检验多智能体系统的调度员(supervisor)。根据用户最新需求，从下列智能体中选择最合适的一个：\n"
     + "\n".join(f"- {name}: {cfg['描述']}" for name, cfg in AGENTS.items())
-    + "\n只输出智能体名称。"
+    + "\n路由参考：查询待办任务/船舶信息→task_agent；新增/删除检验项、生成检验前准备单→prepare_agent；"
+    "确认遗留项/归档→archive_agent；撰写检验报告/文书→report_agent；其他法规咨询等→general_agent。"
+    "\n只输出一行英文智能体名称（如 task_agent），不要输出其他内容。"
 )
 
 
