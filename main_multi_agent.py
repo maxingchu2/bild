@@ -16,6 +16,7 @@
 import csv
 import json
 import os
+import re
 import uuid
 from datetime import datetime
 from typing import AsyncGenerator, Literal
@@ -464,6 +465,7 @@ def save_conversations(convs: list[dict]) -> None:
 class SaveConversationRequest(BaseModel):
     messages: list[Message]
     title: str = ""
+    conv_id: str = ""
 
 
 @app.get("/api/conversations")
@@ -496,17 +498,27 @@ async def save_conversation(req: SaveConversationRequest):
         first_user = next((m.content for m in req.messages if m.role == "user"), "新对话")
         if first_user.startswith("开始新的检验工作会话"):
             first_user = "检验工作会话"
+        first_user = re.sub(r"^【[^】]*】\s*", "", first_user) or "新对话"
         title = first_user.replace("\n", " ")[:24]
-    conv = {
-        "id": uuid.uuid4().hex,
-        "title": title,
-        "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "messages": json.dumps(
-            [{"role": m.role, "content": m.content} for m in req.messages],
-            ensure_ascii=False,
-        ),
-    }
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    messages_json = json.dumps(
+        [{"role": m.role, "content": m.content} for m in req.messages],
+        ensure_ascii=False,
+    )
     convs = load_conversations()
+    if req.conv_id:
+        for c in convs:
+            if c["id"] == req.conv_id:
+                c["messages"] = messages_json
+                c["time"] = now
+                save_conversations(convs)
+                return {"saved": True, "id": c["id"], "title": c["title"], "time": now}
+    conv = {
+        "id": req.conv_id or uuid.uuid4().hex,
+        "title": title,
+        "time": now,
+        "messages": messages_json,
+    }
     convs.append(conv)
     save_conversations(convs)
     return {"saved": True, "id": conv["id"], "title": conv["title"], "time": conv["time"]}
