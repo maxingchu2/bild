@@ -64,7 +64,7 @@ def load_ships() -> dict:
         for row in csv.DictReader(f):
             if row["船名"] in ships:
                 ships[row["船名"]]["检验项"].append(
-                    {"编号": row["编号"], "名称": row["名称"], "类别": row["类别"]}
+                    {"编号": row["编号"], "名称": row["名称"], "类别": row["类别"], "风险": row.get("风险") or "低风险"}
                 )
     with open(ISSUES_CSV, encoding="utf-8-sig", newline="") as f:
         for row in csv.DictReader(f):
@@ -83,10 +83,10 @@ def save_ships() -> None:
             w.writerow([name, s["CCSNO"], s["船舶类型"], s["建造日期"], s["检验类型"], s["状态"]])
     with open(ITEMS_CSV, "w", encoding="utf-8-sig", newline="") as f:
         w = csv.writer(f)
-        w.writerow(["船名", "编号", "名称", "类别"])
+        w.writerow(["船名", "编号", "名称", "类别", "风险"])
         for name, s in SHIPS.items():
             for i in s["检验项"]:
-                w.writerow([name, i["编号"], i["名称"], i["类别"]])
+                w.writerow([name, i["编号"], i["名称"], i["类别"], i.get("风险", "低风险")])
     with open(ISSUES_CSV, "w", encoding="utf-8-sig", newline="") as f:
         w = csv.writer(f)
         w.writerow(["船名", "编号", "问题", "状态"])
@@ -118,8 +118,8 @@ def query_ship_info(ship_name: str) -> str:
 
 
 @tool
-def add_inspection_item(ship_name: str, item_name: str, category: str, item_id: str = "") -> str:
-    """为指定船舶新增一个检验项。category 为类别，如 救生设备/消防设备/外板测厚；item_id 可选，为检验项编号（如 FC-119），不填则自动编号。"""
+def add_inspection_item(ship_name: str, item_name: str, category: str, item_id: str = "", risk: str = "低风险") -> str:
+    """为指定船舶新增一个检验项。category 为类别，如 救生设备/消防设备/外板测厚；item_id 可选，为检验项编号（如 FC-119），不填则自动编号；risk 可选，为风险等级（高风险/中风险/低风险，默认低风险）。"""
     ship = SHIPS.get(ship_name)
     if not ship:
         return f"未找到船舶「{ship_name}」"
@@ -130,9 +130,11 @@ def add_inspection_item(ship_name: str, item_name: str, category: str, item_id: 
         exist = next(i for i in items if i["编号"] == item_id)
         return f"新增失败：编号「{item_id}」已被检验项「{exist['名称']}」占用，请更换编号或不指定编号（自动编号）"
     new_id = item_id or f"NEW-{len(items) + 1}"
-    items.append({"编号": new_id, "名称": item_name, "类别": category})
+    if risk not in ("高风险", "中风险", "低风险"):
+        risk = "低风险"
+    items.append({"编号": new_id, "名称": item_name, "类别": category, "风险": risk})
     save_ships()
-    return f"已新增检验项 {new_id}「{item_name}」（{category}），已写入 CSV，当前共 {len(items)} 项"
+    return f"已新增检验项 {new_id}「{item_name}」（{category}，{risk}），已写入 CSV，当前共 {len(items)} 项"
 
 
 @tool
