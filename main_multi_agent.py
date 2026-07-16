@@ -118,17 +118,21 @@ def query_ship_info(ship_name: str) -> str:
 
 
 @tool
-def add_inspection_item(ship_name: str, item_name: str, category: str) -> str:
-    """为指定船舶新增一个检验项。category 为类别，如 救生设备/消防设备/外板测厚。"""
+def add_inspection_item(ship_name: str, item_name: str, category: str, item_id: str = "") -> str:
+    """为指定船舶新增一个检验项。category 为类别，如 救生设备/消防设备/外板测厚；item_id 可选，为检验项编号（如 FC-119），不填则自动编号。"""
     ship = SHIPS.get(ship_name)
     if not ship:
         return f"未找到船舶「{ship_name}」"
     items = ship["检验项"]
     if any(i["名称"] == item_name for i in items):
         return f"「{item_name}」已在当前检验项中"
-    items.append({"编号": f"NEW-{len(items) + 1}", "名称": item_name, "类别": category})
+    if item_id and any(i["编号"] == item_id for i in items):
+        exist = next(i for i in items if i["编号"] == item_id)
+        return f"新增失败：编号「{item_id}」已被检验项「{exist['名称']}」占用，请更换编号或不指定编号（自动编号）"
+    new_id = item_id or f"NEW-{len(items) + 1}"
+    items.append({"编号": new_id, "名称": item_name, "类别": category})
     save_ships()
-    return f"已新增检验项「{item_name}」（{category}），已写入 CSV，当前共 {len(items)} 项"
+    return f"已新增检验项 {new_id}「{item_name}」（{category}），已写入 CSV，当前共 {len(items)} 项"
 
 
 @tool
