@@ -137,17 +137,17 @@ def add_inspection_item(ship_name: str, item_name: str, category: str, item_id: 
 
 @tool
 def remove_inspection_item(ship_name: str, item_name: str) -> str:
-    """删除指定船舶的某个检验项（删除痕迹保留）。"""
+    """删除指定船舶的某个检验项，item_name 可以是检验项名称或编号（如 FC-125）。"""
     ship = SHIPS.get(ship_name)
     if not ship:
         return f"未找到船舶「{ship_name}」"
     items = ship["检验项"]
     for i in items:
-        if i["名称"] == item_name:
+        if item_name in (i["名称"], i["编号"]):
             items.remove(i)
             save_ships()
-            return f"已删除检验项「{item_name}」（已写入 CSV），当前共 {len(items)} 项"
-    return f"检验项「{item_name}」不存在"
+            return f"已删除检验项 {i['编号']}「{i['名称']}」（已写入 CSV），当前共 {len(items)} 项"
+    return f"删除失败：检验项「{item_name}」不存在（可用名称或编号删除），请先查询船舶信息确认检验项清单"
 
 
 @tool
