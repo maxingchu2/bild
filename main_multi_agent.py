@@ -410,6 +410,11 @@ async def overview():
     return counts
 
 
+@app.get("/api/ships")
+async def list_ships():
+    return SHIPS
+
+
 @app.post("/api/ships/{ship_name}/items")
 async def save_ship_items(ship_name: str, req: SaveItemsRequest):
     ship = SHIPS.get(ship_name)
