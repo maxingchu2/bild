@@ -514,14 +514,14 @@ async def save_conversation(req: SaveConversationRequest):
 async def ship_page(_path: str = ""):
     html_path = os.path.join(os.path.dirname(__file__), "static", "ship-inspection.html")
     with open(html_path, encoding="utf-8") as f:
-        return f.read()
+        return HTMLResponse(f.read(), headers={"Cache-Control": "no-cache"})
 
 
 @app.get("/", response_class=HTMLResponse)
 async def index():
     html_path = os.path.join(os.path.dirname(__file__), "static", "index.html")
     with open(html_path, encoding="utf-8") as f:
-        return f.read()
+        return HTMLResponse(f.read(), headers={"Cache-Control": "no-cache"})
 
 
 if __name__ == "__main__":
