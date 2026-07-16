@@ -13,6 +13,7 @@
 前端 static/index.html 零改动；智能体切换与工具执行过程实时显示在思考区。
 """
 
+import csv
 import json
 import os
 from typing import AsyncGenerator, Literal
@@ -42,68 +43,56 @@ app.add_middleware(
 llm = ChatOpenAI(base_url=BASE_URL, api_key=API_KEY, model=MODEL, streaming=True)
 
 
-# ==================== 模拟业务数据（对接时替换为真实数据库/Java 接口） ====================
+# ==================== 业务数据：CSV 文件即数据接口（对接时替换为真实数据库/Java 接口） ====================
 
-SHIPS = {
-    "远洋之星": {
-        "CCSNO": "CCS2023001", "船舶类型": "散货船", "建造日期": "2018-05-20",
-        "检验类型": "年度检验", "状态": "待检验前准备",
-        "检验项": [
-            {"编号": 1, "名称": "救生艇及降落装置", "类别": "救生设备"},
-            {"编号": 2, "名称": "救生圈及自亮灯", "类别": "救生设备"},
-            {"编号": 3, "名称": "应急消防泵压力检查", "类别": "消防设备"},
-            {"编号": 4, "名称": "火灾探测器功能试验", "类别": "消防设备"},
-            {"编号": 5, "名称": "外板腐蚀测厚", "类别": "外板测厚"},
-        ],
-        "遗留复查项": [
-            {"编号": "L1", "问题": "应急消防泵压力不足", "状态": "未确认"},
-            {"编号": "L2", "问题": "船体板厚局部减薄", "状态": "未确认"},
-        ],
-    },
-    "东海明珠": {
-        "CCSNO": "CCS2023002", "船舶类型": "集装箱船", "建造日期": "2020-11-02",
-        "检验类型": "特别检验", "状态": "待归档",
-        "检验项": [
-            {"编号": 1, "名称": "主机运行状态检查", "类别": "主机系统"},
-            {"编号": 2, "名称": "舵机密封检查", "类别": "舵机系统"},
-        ],
-        "遗留复查项": [],
-    },
-    "MV PACIFIC STAR": {
-        "CCSNO": "9876543", "船舶类型": "散货船 (Bulk Carrier)", "建造日期": "2025-04-11",
-        "检验类型": "年度检验", "状态": "待检验前准备",
-        "检验项": [
-            {"编号": "SC-205", "名称": "救生艇及降落装置", "类别": "救生设备"},
-            {"编号": "SC-212", "名称": "救生圈及自亮灯", "类别": "救生设备"},
-            {"编号": "FC-119", "名称": "应急消防泵压力检查", "类别": "消防设备"},
-            {"编号": "FC-121", "名称": "火灾探测器功能试验", "类别": "消防设备"},
-            {"编号": "HK-301", "名称": "外板腐蚀测厚", "类别": "外板测厚"},
-        ],
-        "遗留复查项": [
-            {"编号": "FC-119", "问题": "应急消防泵压力不足", "状态": "未确认"},
-            {"编号": "HK-301", "问题": "船体板厚局部减薄", "状态": "未确认"},
-            {"编号": "ME-40", "问题": "舵机密封渗漏", "状态": "未确认"},
-        ],
-    },
-    "MV OCEAN PIONEER": {
-        "CCSNO": "8765432", "船舶类型": "散货船 (Bulk Carrier)", "建造日期": "2020-08-15",
-        "检验类型": "年度检验", "状态": "待归档",
-        "检验项": [
-            {"编号": "SC-201", "名称": "救生艇释放装置检查", "类别": "救生设备"},
-            {"编号": "FC-118", "名称": "消防主管线检查", "类别": "消防设备"},
-        ],
-        "遗留复查项": [
-            {"编号": "Q-001", "问题": "救生艇释放装置卡滞", "状态": "未确认"},
-            {"编号": "Q-002", "问题": "消防主管线腐蚀", "状态": "未确认"},
-        ],
-    },
-    "MV ATLANTIC VOYAGER": {
-        "CCSNO": "7654321", "船舶类型": "集装箱船", "建造日期": "2019-03-22",
-        "检验类型": "特别检验", "状态": "已完成",
-        "检验项": [],
-        "遗留复查项": [],
-    },
-}
+DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
+SHIPS_CSV = os.path.join(DATA_DIR, "ships.csv")
+ITEMS_CSV = os.path.join(DATA_DIR, "inspection_items.csv")
+ISSUES_CSV = os.path.join(DATA_DIR, "legacy_issues.csv")
+
+
+def load_ships() -> dict:
+    ships = {}
+    with open(SHIPS_CSV, encoding="utf-8-sig", newline="") as f:
+        for row in csv.DictReader(f):
+            name = row.pop("船名")
+            ships[name] = {**row, "检验项": [], "遗留复查项": []}
+    with open(ITEMS_CSV, encoding="utf-8-sig", newline="") as f:
+        for row in csv.DictReader(f):
+            if row["船名"] in ships:
+                ships[row["船名"]]["检验项"].append(
+                    {"编号": row["编号"], "名称": row["名称"], "类别": row["类别"]}
+                )
+    with open(ISSUES_CSV, encoding="utf-8-sig", newline="") as f:
+        for row in csv.DictReader(f):
+            if row["船名"] in ships:
+                ships[row["船名"]]["遗留复查项"].append(
+                    {"编号": row["编号"], "问题": row["问题"], "状态": row["状态"]}
+                )
+    return ships
+
+
+def save_ships() -> None:
+    with open(SHIPS_CSV, "w", encoding="utf-8-sig", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["船名", "CCSNO", "船舶类型", "建造日期", "检验类型", "状态"])
+        for name, s in SHIPS.items():
+            w.writerow([name, s["CCSNO"], s["船舶类型"], s["建造日期"], s["检验类型"], s["状态"]])
+    with open(ITEMS_CSV, "w", encoding="utf-8-sig", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["船名", "编号", "名称", "类别"])
+        for name, s in SHIPS.items():
+            for i in s["检验项"]:
+                w.writerow([name, i["编号"], i["名称"], i["类别"]])
+    with open(ISSUES_CSV, "w", encoding="utf-8-sig", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["船名", "编号", "问题", "状态"])
+        for name, s in SHIPS.items():
+            for i in s["遗留复查项"]:
+                w.writerow([name, i["编号"], i["问题"], i["状态"]])
+
+
+SHIPS = load_ships()
 
 
 # ==================== 各智能体的工具 ====================
@@ -134,8 +123,9 @@ def add_inspection_item(ship_name: str, item_name: str, category: str) -> str:
     items = ship["检验项"]
     if any(i["名称"] == item_name for i in items):
         return f"「{item_name}」已在当前检验项中"
-    items.append({"编号": len(items) + 1, "名称": item_name, "类别": category})
-    return f"已新增检验项「{item_name}」（{category}），当前共 {len(items)} 项"
+    items.append({"编号": f"NEW-{len(items) + 1}", "名称": item_name, "类别": category})
+    save_ships()
+    return f"已新增检验项「{item_name}」（{category}），已写入 CSV，当前共 {len(items)} 项"
 
 
 @tool
@@ -148,7 +138,8 @@ def remove_inspection_item(ship_name: str, item_name: str) -> str:
     for i in items:
         if i["名称"] == item_name:
             items.remove(i)
-            return f"已删除检验项「{item_name}」（删除痕迹已保留），当前共 {len(items)} 项"
+            save_ships()
+            return f"已删除检验项「{item_name}」（已写入 CSV），当前共 {len(items)} 项"
     return f"检验项「{item_name}」不存在"
 
 
@@ -177,7 +168,8 @@ def confirm_legacy_issue(ship_name: str, issue_id: str) -> str:
     for issue in ship["遗留复查项"]:
         if issue["编号"] == issue_id:
             issue["状态"] = "已确认"
-            return f"遗留复查项 {issue_id}「{issue['问题']}」已确认"
+            save_ships()
+            return f"遗留复查项 {issue_id}「{issue['问题']}」已确认（已写入 CSV）"
     return f"未找到遗留复查项 {issue_id}"
 
 
@@ -191,7 +183,8 @@ def archive_record(ship_name: str) -> str:
     if unconfirmed:
         return f"归档失败：还有 {len(unconfirmed)} 项遗留复查项未确认: " + json.dumps(unconfirmed, ensure_ascii=False)
     ship["状态"] = "已归档"
-    return f"「{ship_name}」检验记录已归档"
+    save_ships()
+    return f"「{ship_name}」检验记录已归档（已写入 CSV）"
 
 
 # ==================== 多智能体定义 ====================
@@ -199,7 +192,12 @@ def archive_record(ship_name: str) -> str:
 AGENTS = {
     "task_agent": {
         "描述": "任务查询智能体：查询待办检验任务、船舶基础信息",
-        "prompt": "你是船舶检验任务查询智能体。使用工具查询待办任务和船舶信息，用 Markdown 表格清晰呈现结果。",
+        "prompt": (
+            "你是船舶检验任务查询智能体。使用工具查询待办任务和船舶信息，用 Markdown 表格清晰呈现结果。"
+            "当用户开始新的会话或请求引导时，先调用 query_pending_tasks 展示待办任务，"
+            "然后引导用户选择下一步（如：查看某船详情、开始检验前准备、确认遗留项并归档、撰写报告）。"
+            "每次回答末尾给出可选的下一步操作建议，逐步引导用户完成检验流程。"
+        ),
         "tools": [query_pending_tasks, query_ship_info],
     },
     "prepare_agent": {
@@ -232,7 +230,7 @@ class AgentState(MessagesState):
 ROUTER_PROMPT = (
     "你是船舶检验多智能体系统的调度员(supervisor)。根据用户最新需求，从下列智能体中选择最合适的一个：\n"
     + "\n".join(f"- {name}: {cfg['描述']}" for name, cfg in AGENTS.items())
-    + "\n路由参考：查询待办任务/船舶信息→task_agent；新增/删除检验项、生成检验前准备单→prepare_agent；"
+    + "\n路由参考：开始新会话/请求引导/查询待办任务/船舶信息→task_agent；新增/删除检验项、生成检验前准备单→prepare_agent；"
     "确认遗留项/归档→archive_agent；撰写检验报告/文书→report_agent；其他法规咨询等→general_agent。"
     "\n只输出一行英文智能体名称（如 task_agent），不要输出其他内容。"
 )
