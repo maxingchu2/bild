@@ -378,6 +378,61 @@ async def list_agents():
     return {name: cfg["描述"] for name, cfg in AGENTS.items()}
 
 
+# ==================== 页面数据接口：任务概览 / 检验项写回 ====================
+
+class ItemPayload(BaseModel):
+    编号: str = ""
+    名称: str
+    类别: str = ""
+
+
+class SaveItemsRequest(BaseModel):
+    items: list[ItemPayload]
+
+
+class SetStatusRequest(BaseModel):
+    状态: str
+
+
+@app.get("/api/overview")
+async def overview():
+    counts = {"待检验": 0, "检验中": 0, "记录归档": 0, "已完成": 0}
+    for s in SHIPS.values():
+        st = s["状态"]
+        if st == "待检验前准备":
+            counts["待检验"] += 1
+        elif st == "检验中":
+            counts["检验中"] += 1
+        elif st == "待归档":
+            counts["记录归档"] += 1
+        else:
+            counts["已完成"] += 1
+    return counts
+
+
+@app.post("/api/ships/{ship_name}/items")
+async def save_ship_items(ship_name: str, req: SaveItemsRequest):
+    ship = SHIPS.get(ship_name)
+    if not ship:
+        return {"saved": False, "error": f"未找到船舶「{ship_name}」"}
+    ship["检验项"] = [
+        {"编号": it.编号 or f"NEW-{idx + 1}", "名称": it.名称, "类别": it.类别}
+        for idx, it in enumerate(req.items)
+    ]
+    save_ships()
+    return {"saved": True, "count": len(ship["检验项"])}
+
+
+@app.post("/api/ships/{ship_name}/status")
+async def set_ship_status(ship_name: str, req: SetStatusRequest):
+    ship = SHIPS.get(ship_name)
+    if not ship:
+        return {"saved": False, "error": f"未找到船舶「{ship_name}」"}
+    ship["状态"] = req.状态
+    save_ships()
+    return {"saved": True, "状态": req.状态}
+
+
 # ==================== 历史对话：CSV 持久化 ====================
 
 CONV_FIELDS = ["id", "title", "time", "messages"]
