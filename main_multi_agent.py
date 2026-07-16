@@ -23,7 +23,7 @@ from typing import AsyncGenerator, Literal
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, StreamingResponse
-from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_core.tools import tool
 from langchain_openai import ChatOpenAI
 from langgraph.graph import END, START, MessagesState, StateGraph
@@ -269,7 +269,9 @@ def make_agent_node(name: str):
 
     async def node(state: AgentState):
         messages = [SystemMessage(content=cfg["prompt"])] + state["messages"]
-        response = await agent_llm.ainvoke(messages)
+        response = None
+        async for chunk in agent_llm.astream(messages):
+            response = chunk if response is None else response + chunk
         return {"messages": [response]}
 
     node.__name__ = name
@@ -335,30 +337,26 @@ def sse(obj: dict) -> str:
 
 async def stream_graph(req: ChatRequest) -> AsyncGenerator[str, None]:
     inputs = {"messages": to_lc_messages(req.messages)}
+    current_agent = None
     try:
-        async for event in graph.astream_events(inputs, version="v2"):
-            kind = event["event"]
-            if kind == "on_chain_start" and event.get("name") in AGENTS:
-                desc = AGENTS[event["name"]]["描述"]
-                yield sse({"reasoning": f"\n[调度至 {desc}]\n"})
-            elif kind == "on_chat_model_stream":
-                if event.get("metadata", {}).get("langgraph_node") == "supervisor":
-                    continue
-                chunk = event["data"]["chunk"]
-                reasoning = (chunk.additional_kwargs or {}).get("reasoning_content") or ""
-                if reasoning:
-                    yield sse({"reasoning": reasoning})
-                if chunk.content:
-                    yield sse({"content": chunk.content})
-            elif kind == "on_tool_start":
-                name = event.get("name", "tool")
-                args = event["data"].get("input")
-                yield sse({"reasoning": f"\n[执行工具 {name}，参数 {json.dumps(args, ensure_ascii=False)}]\n"})
-            elif kind == "on_tool_end":
-                name = event.get("name", "tool")
-                output = event["data"].get("output")
-                text = getattr(output, "content", output)
-                yield sse({"reasoning": f"[工具 {name} 返回: {text}]\n"})
+        async for msg, meta in graph.astream(inputs, stream_mode="messages"):
+            node = meta.get("langgraph_node")
+            if node == "supervisor":
+                continue
+            if node in AGENTS and node != current_agent:
+                current_agent = node
+                yield sse({"reasoning": f"\n[调度至 {AGENTS[node]['描述']}]\n"})
+            if isinstance(msg, ToolMessage):
+                yield sse({"reasoning": f"[工具 {msg.name} 返回: {msg.content}]\n"})
+                continue
+            reasoning = (msg.additional_kwargs or {}).get("reasoning_content") or ""
+            if reasoning:
+                yield sse({"reasoning": reasoning})
+            for tc in msg.tool_calls or []:
+                if tc.get("name"):
+                    yield sse({"reasoning": f"\n[执行工具 {tc['name']}，参数 {json.dumps(tc.get('args'), ensure_ascii=False)}]\n"})
+            if msg.content:
+                yield sse({"content": msg.content})
     except Exception as e:
         yield sse({"error": f"执行出错: {e}"})
     yield "data: [DONE]\n\n"
