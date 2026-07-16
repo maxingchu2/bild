@@ -16,6 +16,8 @@
 import csv
 import json
 import os
+import uuid
+from datetime import datetime
 from typing import AsyncGenerator, Literal
 
 from fastapi import FastAPI
@@ -49,6 +51,7 @@ DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
 SHIPS_CSV = os.path.join(DATA_DIR, "ships.csv")
 ITEMS_CSV = os.path.join(DATA_DIR, "inspection_items.csv")
 ISSUES_CSV = os.path.join(DATA_DIR, "legacy_issues.csv")
+CONVS_CSV = os.path.join(DATA_DIR, "conversations.csv")
 
 
 def load_ships() -> dict:
@@ -373,6 +376,76 @@ async def chat(req: ChatRequest):
 @app.get("/api/agents")
 async def list_agents():
     return {name: cfg["描述"] for name, cfg in AGENTS.items()}
+
+
+# ==================== 历史对话：CSV 持久化 ====================
+
+CONV_FIELDS = ["id", "title", "time", "messages"]
+
+
+def load_conversations() -> list[dict]:
+    if not os.path.exists(CONVS_CSV):
+        return []
+    with open(CONVS_CSV, encoding="utf-8-sig", newline="") as f:
+        return list(csv.DictReader(f))
+
+
+def save_conversations(convs: list[dict]) -> None:
+    with open(CONVS_CSV, "w", encoding="utf-8-sig", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=CONV_FIELDS)
+        w.writeheader()
+        w.writerows(convs)
+
+
+class SaveConversationRequest(BaseModel):
+    messages: list[Message]
+    title: str = ""
+
+
+@app.get("/api/conversations")
+async def list_conversations():
+    return [
+        {"id": c["id"], "title": c["title"], "time": c["time"]}
+        for c in reversed(load_conversations())
+    ]
+
+
+@app.get("/api/conversations/{conv_id}")
+async def get_conversation(conv_id: str):
+    for c in load_conversations():
+        if c["id"] == conv_id:
+            return {
+                "id": c["id"],
+                "title": c["title"],
+                "time": c["time"],
+                "messages": json.loads(c["messages"]),
+            }
+    return {"id": conv_id, "title": "", "time": "", "messages": []}
+
+
+@app.post("/api/conversations")
+async def save_conversation(req: SaveConversationRequest):
+    if not req.messages:
+        return {"saved": False}
+    title = req.title.strip()
+    if not title:
+        first_user = next((m.content for m in req.messages if m.role == "user"), "新对话")
+        if first_user.startswith("开始新的检验工作会话"):
+            first_user = "检验工作会话"
+        title = first_user.replace("\n", " ")[:24]
+    conv = {
+        "id": uuid.uuid4().hex,
+        "title": title,
+        "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "messages": json.dumps(
+            [{"role": m.role, "content": m.content} for m in req.messages],
+            ensure_ascii=False,
+        ),
+    }
+    convs = load_conversations()
+    convs.append(conv)
+    save_conversations(convs)
+    return {"saved": True, "id": conv["id"], "title": conv["title"], "time": conv["time"]}
 
 
 @app.get("/ship", response_class=HTMLResponse)
