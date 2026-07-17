@@ -944,6 +944,334 @@ async def stream_add_check_item(
     )
 
 
+# ==================== 删除检查项（DELETE_CHECK_ITEM） ====================
+
+DELETE_CHECK_ITEM_PATTERN = re.compile(
+    r"(删除|移除|去掉).{0,40}检[验查]|检[验查]项.{0,20}(删除|移除|去掉)"
+)
+
+
+def detect_delete_check_item(req: ClassifyRequest) -> bool:
+    if req.actionCode == "DELETE_CHECK_ITEM":
+        return True
+    if req.actionCode:
+        return False
+    return bool(req.content and DELETE_CHECK_ITEM_PATTERN.search(req.content))
+
+
+def flatten_check_item_tree(tree: list) -> list:
+    flat = []
+    for discipline in tree or []:
+        for section in discipline.get("sections") or []:
+            for item in section.get("items") or []:
+                flat.append(
+                    {
+                        **item,
+                        "disciplineCode": discipline.get("disciplineCode"),
+                        "disciplineName": discipline.get("disciplineName"),
+                        "sectionName": section.get("sectionName"),
+                    }
+                )
+    return flat
+
+
+def parse_delete_target(content: str, params: dict | None) -> dict:
+    out = {k: v for k, v in (params or {}).items() if v not in (None, "")}
+    text = content or ""
+    if not out.get("itemCode"):
+        m = re.search(r"编号[：:\s]*([A-Za-z][A-Za-z0-9\-_]*)", text) or re.search(
+            r"\b([A-Z]{2,}-\d+)\b", text
+        )
+        if m:
+            out["itemCode"] = m.group(1)
+    if not out.get("targetText") and not out.get("itemName") and not out.get("itemId"):
+        m = (
+            re.search(r"(?:删除|移除|去掉)[：:，,\s]*(.+?)(?:这个|这条|这一项)?检[验查]项", text)
+            or re.search(r"(?:删除|移除|去掉)检[验查]项[：:，,\s]*([^，,。;；\s]+)", text)
+            or re.search(r"把(.+?)(?:这个|这条|这一项)?检[验查]项?(?:从.*)?(?:删除|移除|去掉)", text)
+        )
+        if m:
+            target = m.group(1).strip("，, 　")
+            if target:
+                out["targetText"] = target
+    return out
+
+
+def match_check_items(flat: list, target: dict) -> list:
+    item_id = target.get("itemId")
+    if item_id not in (None, ""):
+        matched = [i for i in flat if str(i.get("itemId")) == str(item_id)]
+        if matched:
+            return matched
+
+    item_code = target.get("itemCode") or ""
+    if item_code:
+        exact = [i for i in flat if (i.get("itemCode") or "") == item_code]
+        if exact:
+            return exact
+        partial = [i for i in flat if item_code in (i.get("itemCode") or "")]
+        if partial:
+            return partial
+
+    item_name = target.get("itemName") or ""
+    if item_name:
+        exact = [i for i in flat if (i.get("itemName") or "") == item_name]
+        if exact:
+            return exact
+        partial = [i for i in flat if item_name in (i.get("itemName") or "")]
+        if partial:
+            return partial
+
+    text = target.get("targetText") or ""
+    if text:
+        exact = [
+            i
+            for i in flat
+            if text in ((i.get("itemName") or ""), (i.get("itemCode") or ""))
+        ]
+        if exact:
+            return exact
+        partial = [
+            i
+            for i in flat
+            if text in (i.get("itemName") or "")
+            or text in (i.get("itemCode") or "")
+            or text in (i.get("sectionName") or "")
+            or text in (i.get("disciplineName") or "")
+        ]
+        if partial:
+            return partial
+
+    candidates = flat
+    has_filter = False
+    for key, field in (
+        ("disciplineName", "disciplineName"),
+        ("sectionName", "sectionName"),
+        ("riskLevel", "riskLevel"),
+    ):
+        value = target.get(key)
+        if value:
+            has_filter = True
+            candidates = [c for c in candidates if (c.get(field) or "") == value]
+    if has_filter:
+        return candidates
+    return []
+
+
+async def delete_check_item_backend(task_id, item_id, reason: str, auth: str) -> None:
+    async with httpx.AsyncClient(base_url=TODO_BACKEND_BASE, timeout=10) as client:
+        resp = await client.delete(
+            f"/api/ai/ship-tasks/{task_id}/check-items/{item_id}",
+            params={"source": "ai", "reason": reason},
+            headers=backend_headers(auth),
+        )
+        resp.raise_for_status()
+
+
+def local_delete_check_item(task_id, item_id) -> bool:
+    items = LOCAL_CHECK_ITEMS.get(str(task_id), [])
+    for idx, item in enumerate(items):
+        if str(item.get("itemId")) == str(item_id):
+            items.pop(idx)
+            return True
+    return False
+
+
+async def stream_delete_check_item(
+    req: ClassifyRequest, auth: str
+) -> AsyncGenerator[str, None]:
+    request_id = str(uuid.uuid4())
+    session_id = req.sessionId or int(datetime.now().timestamp() * 1000)
+    if isinstance(session_id, str) and session_id.isdigit():
+        session_id = int(session_id)
+    turn_id = int(datetime.now().timestamp() * 1000) + 1
+    user_message_id = turn_id + 1
+
+    yield sse_event(
+        "message_start",
+        {
+            "requestId": request_id,
+            "sessionId": session_id,
+            "turnId": turn_id,
+            "userMessageId": user_message_id,
+            "assistantMessageId": None,
+            "status": "running",
+        },
+    )
+
+    task_id = req.taskId
+    if isinstance(task_id, str) and task_id.isdigit():
+        task_id = int(task_id)
+    target = parse_delete_target(req.content or "", req.actionParams)
+
+    def base_delta(status: str, content: str) -> dict:
+        return {
+            "seq": 1,
+            "type": "action_result",
+            "actionCode": "DELETE_CHECK_ITEM",
+            "actionName": "删除检查项",
+            "status": status,
+            "content": content,
+            "taskId": task_id,
+            "deletedItem": None,
+            "checkItemTotal": None,
+            "check_list": [],
+        }
+
+    async def finish(delta: dict, extra_action_result: dict | None = None):
+        yield sse_event("answer_delta", delta)
+        if extra_action_result is not None:
+            yield sse_event("action_result", extra_action_result)
+        yield sse_event(
+            "message_end",
+            {
+                "requestId": request_id,
+                "sessionId": session_id,
+                "turnId": turn_id,
+                "userMessageId": user_message_id,
+                "assistantMessageId": user_message_id + 1,
+                "status": "success",
+                "actionCode": "DELETE_CHECK_ITEM",
+            },
+        )
+
+    if task_id in (None, ""):
+        async for chunk in finish(
+            base_delta("rejected", "删除失败：该操作需要关联检验任务。")
+        ):
+            yield chunk
+        return
+
+    tree_source = "check_items_after_delete"
+    use_local = False
+    try:
+        tree = await fetch_check_item_tree(task_id, auth)
+    except Exception as e:
+        print(
+            f"[check-item] 后端检查项树接口不可达（{TODO_BACKEND_BASE}），降级为本地数据: {e}",
+            flush=True,
+        )
+        use_local = True
+        tree_source = "local_check_items"
+        tree = local_check_item_tree(task_id)
+
+    flat = flatten_check_item_tree(tree)
+    total = count_check_items(tree)
+
+    def delta_with_tree(status: str, content: str) -> dict:
+        delta = base_delta(status, content)
+        delta["checkItemTotal"] = total
+        delta["check_list"] = tree
+        delta["checkItemTree"] = tree
+        return delta
+
+    has_target = any(
+        target.get(k)
+        for k in (
+            "itemId",
+            "itemCode",
+            "itemName",
+            "targetText",
+            "disciplineName",
+            "sectionName",
+            "riskLevel",
+        )
+    )
+    if not has_target:
+        async for chunk in finish(
+            delta_with_tree("rejected", "删除失败：请提供要删除的检查项名称或编号。")
+        ):
+            yield chunk
+        return
+
+    matched = match_check_items(flat, target)
+    if not matched:
+        async for chunk in finish(
+            delta_with_tree("rejected", "删除失败：未找到匹配的检查项。")
+        ):
+            yield chunk
+        return
+    if len(matched) > 1:
+        delta = delta_with_tree(
+            "rejected", "删除失败：匹配到多个检查项，请补充检查项编号或完整名称。"
+        )
+        delta["candidates"] = [
+            {
+                "itemId": i.get("itemId"),
+                "itemCode": i.get("itemCode"),
+                "itemName": i.get("itemName"),
+            }
+            for i in matched
+        ]
+        async for chunk in finish(delta):
+            yield chunk
+        return
+
+    item = matched[0]
+    reason = target.get("reason") or (req.content or "AI 根据用户要求删除检查项")[:200]
+    if use_local:
+        deleted = local_delete_check_item(task_id, item.get("itemId"))
+    else:
+        try:
+            await delete_check_item_backend(task_id, item.get("itemId"), reason, auth)
+            deleted = True
+        except Exception as e:
+            print(f"[check-item] 删除接口调用失败: {e}", flush=True)
+            deleted = False
+    if not deleted:
+        async for chunk in finish(
+            delta_with_tree("failed", "删除失败：删除检查项接口调用失败，请稍后重试。")
+        ):
+            yield chunk
+        return
+
+    if use_local:
+        tree = local_check_item_tree(task_id)
+    else:
+        try:
+            tree = await fetch_check_item_tree(task_id, auth)
+        except Exception as e:
+            print(f"[check-item] 删除后检查项树查询失败: {e}", flush=True)
+            tree = []
+    total = count_check_items(tree)
+
+    deleted_item = {
+        "itemId": item.get("itemId"),
+        "itemCode": item.get("itemCode"),
+        "itemName": item.get("itemName"),
+        "disciplineName": item.get("disciplineName"),
+        "sectionName": item.get("sectionName"),
+        "riskLevel": item.get("riskLevel"),
+        "riskLevelName": item.get("riskLevelName")
+        or RISK_LEVEL_NAMES.get(item.get("riskLevel") or "", ""),
+    }
+    delta = base_delta("success", f"删除成功，现有 {total} 条检查项。")
+    delta.update(
+        {
+            "deletedItem": deleted_item,
+            "checkItemTotal": total,
+            "check_list": tree,
+            "checkItemTree": tree,
+            "refresh": ["checkItems", "overview"],
+            "source": tree_source,
+        }
+    )
+    async for chunk in finish(
+        delta,
+        {
+            "actionCode": "DELETE_CHECK_ITEM",
+            "status": "success",
+            "message": "删除成功",
+            "payload": {
+                "taskId": task_id,
+                "deletedItem": deleted_item,
+                "checkItemTotal": total,
+            },
+        },
+    ):
+        yield chunk
+
+
 @app.post("/api/ai/chat/classify")
 async def chat_classify(request: Request):
     raw = await request.body()
@@ -962,11 +1290,12 @@ async def chat_classify(request: Request):
         data = {}
     req = ClassifyRequest.model_validate(data)
     auth = request.headers.get("Authorization", "")
-    stream = (
-        stream_add_check_item(req, auth)
-        if detect_add_check_item(req)
-        else stream_classify(req, auth)
-    )
+    if detect_delete_check_item(req):
+        stream = stream_delete_check_item(req, auth)
+    elif detect_add_check_item(req):
+        stream = stream_add_check_item(req, auth)
+    else:
+        stream = stream_classify(req, auth)
     return StreamingResponse(
         stream,
         media_type="text/event-stream",
