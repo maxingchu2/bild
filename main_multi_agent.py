@@ -23,8 +23,9 @@ from typing import AsyncGenerator, Literal
 
 import httpx
 from fastapi import FastAPI, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_core.tools import tool
 from langchain_openai import ChatOpenAI
@@ -45,6 +46,16 @@ app.add_middleware(
 )
 
 llm = ChatOpenAI(base_url=BASE_URL, api_key=API_KEY, model=MODEL, streaming=True)
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_error_handler(request: Request, exc: RequestValidationError):
+    body = await request.body()
+    print(
+        f"[422] path={request.url.path} errors={exc.errors()} body={body.decode('utf-8', 'replace')[:2000]}",
+        flush=True,
+    )
+    return JSONResponse(status_code=422, content={"detail": exc.errors()})
 
 
 # ==================== 业务数据：CSV 文件即数据接口（对接时替换为真实数据库/Java 接口） ====================
@@ -397,16 +408,18 @@ STATUS_CODE_MAP = {
 
 
 class ClassifyRequest(BaseModel):
-    sessionId: int | None = None
-    taskId: int | None = None
-    clientType: str = "pc"
-    pageCode: str = "home"
-    sessionType: str = "mixed"
-    clientMessageId: str = ""
-    content: str
-    actionCode: str = ""
-    actionParams: dict = Field(default_factory=dict)
-    attachmentIds: list[int] = Field(default_factory=list)
+    model_config = {"extra": "ignore"}
+
+    sessionId: int | str | None = None
+    taskId: int | str | None = None
+    clientType: str | None = "pc"
+    pageCode: str | None = "home"
+    sessionType: str | None = "mixed"
+    clientMessageId: str | None = ""
+    content: str = ""
+    actionCode: str | None = ""
+    actionParams: dict | None = None
+    attachmentIds: list[int | str] | None = None
 
 
 def sse_event(event: str, data: dict) -> str:
@@ -504,6 +517,8 @@ async def fetch_todo_summary(
 async def stream_classify(req: ClassifyRequest, auth: str) -> AsyncGenerator[str, None]:
     request_id = str(uuid.uuid4())
     session_id = req.sessionId or int(datetime.now().timestamp() * 1000)
+    if isinstance(session_id, str) and session_id.isdigit():
+        session_id = int(session_id)
     turn_id = int(datetime.now().timestamp() * 1000) + 1
     user_message_id = turn_id + 1
     seq = 0
@@ -520,10 +535,11 @@ async def stream_classify(req: ClassifyRequest, auth: str) -> AsyncGenerator[str
         },
     )
 
-    page = int(req.actionParams.get("todoPage") or 1)
-    limit = int(req.actionParams.get("todoLimit") or 20)
+    params = req.actionParams or {}
+    page = int(params.get("todoPage") or 1)
+    limit = int(params.get("todoLimit") or 20)
     try:
-        todo = await fetch_todo_summary(req.clientType, page, limit, auth)
+        todo = await fetch_todo_summary(req.clientType or "pc", page, limit, auth)
     except Exception as e:
         print(f"[todo] 后端待办接口不可达（{TODO_BACKEND_BASE}），降级为本地数据: {e}", flush=True)
         try:
@@ -597,7 +613,7 @@ async def stream_classify(req: ClassifyRequest, auth: str) -> AsyncGenerator[str
 
     status = "success"
     try:
-        inputs = {"messages": [HumanMessage(content=req.content)]}
+        inputs = {"messages": [HumanMessage(content=req.content or "查询我的待办任务")]}
         async for msg, meta in graph.astream(inputs, stream_mode="messages"):
             node = meta.get("langgraph_node")
             if node == "supervisor" or isinstance(msg, ToolMessage):
