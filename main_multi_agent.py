@@ -644,7 +644,22 @@ async def stream_classify(req: ClassifyRequest, auth: str) -> AsyncGenerator[str
 
 
 @app.post("/api/ai/chat/classify")
-async def chat_classify(req: ClassifyRequest, request: Request):
+async def chat_classify(request: Request):
+    raw = await request.body()
+    if raw:
+        try:
+            data = json.loads(raw)
+        except Exception as e:
+            print(
+                f"[classify] 请求体不是合法 JSON，按空请求处理: {e} body={raw.decode('utf-8', 'replace')[:2000]}",
+                flush=True,
+            )
+            data = {}
+    else:
+        data = {}
+    if not isinstance(data, dict):
+        data = {}
+    req = ClassifyRequest.model_validate(data)
     auth = request.headers.get("Authorization", "")
     return StreamingResponse(
         stream_classify(req, auth),
