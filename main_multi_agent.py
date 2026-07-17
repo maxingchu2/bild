@@ -643,6 +643,307 @@ async def stream_classify(req: ClassifyRequest, auth: str) -> AsyncGenerator[str
         )
 
 
+# ==================== 新增检验项（ADD_CHECK_ITEM） ====================
+
+RISK_LEVEL_NAMES = {"high": "高风险", "medium": "中风险", "low": "低风险"}
+RISK_WORD_MAP = {"高": "high", "中": "medium", "低": "low"}
+ADD_CHECK_ITEM_PATTERN = re.compile(r"新增检[验查]项")
+
+LOCAL_CHECK_ITEMS: dict = {}
+LOCAL_ITEM_ID_SEQ = {"value": 90000}
+
+
+def detect_add_check_item(req: ClassifyRequest) -> bool:
+    if req.actionCode == "ADD_CHECK_ITEM":
+        return True
+    return bool(req.content and ADD_CHECK_ITEM_PATTERN.search(req.content))
+
+
+def parse_check_item_params(content: str, params: dict | None) -> dict:
+    out = {k: v for k, v in (params or {}).items() if v not in (None, "")}
+    text = content or ""
+    if not out.get("itemName"):
+        m = re.search(r"新增检[验查]项[：:，,\s]*([^，,。;；\s]+)", text)
+        if m:
+            out["itemName"] = m.group(1)
+    if not out.get("itemCode"):
+        m = re.search(r"编号[：:\s]*([A-Za-z][A-Za-z0-9\-_]*)", text) or re.search(
+            r"\b([A-Z]{2,}-\d+)\b", text
+        )
+        if m:
+            out["itemCode"] = m.group(1)
+    if not out.get("disciplineName"):
+        m = re.search(r"专业[：:\s]*([^，,。;；\s]+)", text)
+        if m:
+            out["disciplineName"] = m.group(1)
+    if not out.get("sectionName"):
+        m = re.search(r"分组[：:\s]*([^，,。;；\s]+)", text)
+        if m:
+            out["sectionName"] = m.group(1)
+    if not out.get("riskLevel"):
+        m = re.search(r"风险等级[：:\s]*(高|中|低|high|medium|low)", text)
+        if m:
+            out["riskLevel"] = RISK_WORD_MAP.get(m.group(1), m.group(1))
+    return out
+
+
+def count_check_items(tree: list) -> int:
+    total = 0
+    for discipline in tree or []:
+        count = discipline.get("count")
+        if count is not None:
+            total += int(count)
+        else:
+            for section in discipline.get("sections") or []:
+                total += len(section.get("items") or [])
+    return total
+
+
+def backend_headers(auth: str) -> dict:
+    headers = {"Accept": "application/json"}
+    if auth:
+        headers["Authorization"] = auth
+    return headers
+
+
+async def add_check_item_backend(task_id, body: dict, auth: str) -> dict:
+    async with httpx.AsyncClient(base_url=TODO_BACKEND_BASE, timeout=10) as client:
+        resp = await client.post(
+            f"/api/ai/ship-tasks/{task_id}/check-items",
+            json=body,
+            headers=backend_headers(auth),
+        )
+        resp.raise_for_status()
+        return (resp.json() or {}).get("data") or {}
+
+
+async def fetch_check_item_tree(task_id, auth: str) -> list:
+    async with httpx.AsyncClient(base_url=TODO_BACKEND_BASE, timeout=10) as client:
+        resp = await client.get(
+            f"/api/ai/ship-tasks/{task_id}/check-items",
+            params={"includeDeleted": "false"},
+            headers=backend_headers(auth),
+        )
+        resp.raise_for_status()
+        data = (resp.json() or {}).get("data")
+        return data or []
+
+
+def local_add_check_item(task_id, body: dict) -> dict:
+    """后端不可达时的降级：在本地内存中维护该任务的检查项。"""
+    LOCAL_ITEM_ID_SEQ["value"] += 1
+    item = {
+        "itemId": LOCAL_ITEM_ID_SEQ["value"],
+        "itemCode": body.get("itemCode", ""),
+        "itemName": body.get("itemName", ""),
+        "disciplineCode": body.get("disciplineCode", ""),
+        "disciplineName": body.get("disciplineName", "") or "未分类",
+        "sectionName": body.get("sectionName", "") or "默认分组",
+        "riskLevel": body.get("riskLevel", ""),
+        "riskLevelName": RISK_LEVEL_NAMES.get(body.get("riskLevel", ""), ""),
+        "status": "pending",
+        "regulationBasis": body.get("regulationBasis"),
+        "actionRequirement": body.get("actionRequirement"),
+    }
+    LOCAL_CHECK_ITEMS.setdefault(str(task_id), []).append(item)
+    return item
+
+
+def local_check_item_tree(task_id) -> list:
+    disciplines: dict = {}
+    for item in LOCAL_CHECK_ITEMS.get(str(task_id), []):
+        d_key = (item.get("disciplineCode") or "", item.get("disciplineName") or "未分类")
+        discipline = disciplines.setdefault(
+            d_key,
+            {
+                "disciplineCode": d_key[0],
+                "disciplineName": d_key[1],
+                "count": 0,
+                "sections": {},
+            },
+        )
+        discipline["count"] += 1
+        section = discipline["sections"].setdefault(
+            item.get("sectionName") or "默认分组",
+            {"sectionName": item.get("sectionName") or "默认分组", "items": []},
+        )
+        section["items"].append(
+            {
+                "itemId": item["itemId"],
+                "itemCode": item["itemCode"],
+                "itemName": item["itemName"],
+                "riskLevel": item["riskLevel"],
+                "riskLevelName": item["riskLevelName"],
+                "status": item["status"],
+                "regulationBasis": item.get("regulationBasis"),
+                "actionRequirement": item.get("actionRequirement"),
+            }
+        )
+    return [
+        {**d, "sections": list(d["sections"].values())} for d in disciplines.values()
+    ]
+
+
+async def stream_add_check_item(
+    req: ClassifyRequest, auth: str
+) -> AsyncGenerator[str, None]:
+    request_id = str(uuid.uuid4())
+    session_id = req.sessionId or int(datetime.now().timestamp() * 1000)
+    if isinstance(session_id, str) and session_id.isdigit():
+        session_id = int(session_id)
+    turn_id = int(datetime.now().timestamp() * 1000) + 1
+    user_message_id = turn_id + 1
+    seq = 0
+
+    yield sse_event(
+        "message_start",
+        {
+            "requestId": request_id,
+            "sessionId": session_id,
+            "turnId": turn_id,
+            "userMessageId": user_message_id,
+            "assistantMessageId": None,
+            "status": "running",
+        },
+    )
+
+    task_id = req.taskId
+    if isinstance(task_id, str) and task_id.isdigit():
+        task_id = int(task_id)
+    params = parse_check_item_params(req.content or "", req.actionParams)
+
+    def base_delta(status: str, content: str) -> dict:
+        return {
+            "seq": 1,
+            "type": "action_result",
+            "actionCode": "ADD_CHECK_ITEM",
+            "actionName": "新增检查项",
+            "status": status,
+            "content": content,
+            "taskId": task_id,
+            "addedItem": None,
+            "checkItemTotal": None,
+            "checkItemTree": [],
+        }
+
+    rejected = None
+    if task_id in (None, ""):
+        rejected = base_delta("rejected", "新增失败：该操作需要关联检验任务。")
+    elif not params.get("itemCode") or not params.get("itemName"):
+        rejected = base_delta("rejected", "新增失败：缺少检验项编号或检验项名称。")
+
+    if rejected is not None:
+        seq = 1
+        yield sse_event("answer_delta", rejected)
+        yield sse_event(
+            "message_end",
+            {
+                "requestId": request_id,
+                "sessionId": session_id,
+                "turnId": turn_id,
+                "userMessageId": user_message_id,
+                "assistantMessageId": user_message_id + 1,
+                "status": "success",
+                "actionCode": "ADD_CHECK_ITEM",
+            },
+        )
+        return
+
+    body = {
+        "itemCode": params.get("itemCode", ""),
+        "itemName": params.get("itemName", ""),
+        "disciplineCode": params.get("disciplineCode", ""),
+        "disciplineName": params.get("disciplineName", ""),
+        "sectionName": params.get("sectionName", ""),
+        "riskLevel": params.get("riskLevel", ""),
+        "source": "ai",
+    }
+    for key in ("categoryName", "regulationBasis", "actionRequirement"):
+        if params.get(key):
+            body[key] = params[key]
+
+    added_item = None
+    tree_source = "check_items_after_add"
+    try:
+        added_item = await add_check_item_backend(task_id, body, auth)
+    except Exception as e:
+        print(
+            f"[check-item] 后端新增接口不可达（{TODO_BACKEND_BASE}），降级为本地数据: {e}",
+            flush=True,
+        )
+        added_item = local_add_check_item(task_id, body)
+        tree_source = "local_check_items"
+
+    if not added_item or not added_item.get("itemId"):
+        added_item = {
+            **(added_item or {}),
+            "itemCode": body["itemCode"],
+            "itemName": body["itemName"],
+            "disciplineCode": body["disciplineCode"],
+            "disciplineName": body["disciplineName"],
+            "sectionName": body["sectionName"],
+            "riskLevel": body["riskLevel"],
+            "riskLevelName": RISK_LEVEL_NAMES.get(body["riskLevel"], ""),
+            "status": "pending",
+        }
+
+    tree = None
+    if tree_source == "local_check_items":
+        tree = local_check_item_tree(task_id)
+    else:
+        try:
+            tree = await fetch_check_item_tree(task_id, auth)
+        except Exception as e:
+            print(f"[check-item] 检查项树查询失败: {e}", flush=True)
+
+    seq = 1
+    if tree is None:
+        delta = base_delta(
+            "partial_success", "新增成功，但暂时无法获取最新检查项列表。"
+        )
+        delta["addedItem"] = added_item
+        yield sse_event("answer_delta", delta)
+    else:
+        total = count_check_items(tree)
+        delta = base_delta("success", f"新增成功，现有 {total} 条检查项。")
+        delta.update(
+            {
+                "addedItem": added_item,
+                "checkItemTotal": total,
+                "checkItemTree": tree,
+                "refresh": ["checkItems", "overview"],
+                "source": tree_source,
+            }
+        )
+        yield sse_event("answer_delta", delta)
+        yield sse_event(
+            "action_result",
+            {
+                "actionCode": "ADD_CHECK_ITEM",
+                "status": "success",
+                "message": "新增成功",
+                "payload": {
+                    "taskId": task_id,
+                    "addedItem": added_item,
+                    "checkItemTotal": total,
+                },
+            },
+        )
+
+    yield sse_event(
+        "message_end",
+        {
+            "requestId": request_id,
+            "sessionId": session_id,
+            "turnId": turn_id,
+            "userMessageId": user_message_id,
+            "assistantMessageId": user_message_id + 1,
+            "status": "success",
+            "actionCode": "ADD_CHECK_ITEM",
+        },
+    )
+
+
 @app.post("/api/ai/chat/classify")
 async def chat_classify(request: Request):
     raw = await request.body()
@@ -661,8 +962,13 @@ async def chat_classify(request: Request):
         data = {}
     req = ClassifyRequest.model_validate(data)
     auth = request.headers.get("Authorization", "")
+    stream = (
+        stream_add_check_item(req, auth)
+        if detect_add_check_item(req)
+        else stream_classify(req, auth)
+    )
     return StreamingResponse(
-        stream_classify(req, auth),
+        stream,
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
