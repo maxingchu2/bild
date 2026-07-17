@@ -21,7 +21,8 @@ import uuid
 from datetime import datetime
 from typing import AsyncGenerator, Literal
 
-from fastapi import FastAPI
+import httpx
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, StreamingResponse
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
@@ -381,6 +382,264 @@ async def chat(req: ChatRequest):
 @app.get("/api/agents")
 async def list_agents():
     return {name: cfg["描述"] for name, cfg in AGENTS.items()}
+
+
+# ==================== 船检智能体模型对话流式接口（/api/ai/chat/classify） ====================
+
+TODO_BACKEND_BASE = os.getenv("TODO_BACKEND_BASE_URL", "http://5.5.5.45:8082")
+
+STATUS_CODE_MAP = {
+    "待检验前准备": ("pending_preparation", "待准备"),
+    "待检验": ("pending_inspection", "待检验"),
+    "检验中": ("inspection", "检验中"),
+    "待归档": ("archive", "待归档"),
+}
+
+
+class ClassifyRequest(BaseModel):
+    sessionId: int | None = None
+    taskId: int | None = None
+    clientType: str = "pc"
+    pageCode: str = "home"
+    sessionType: str = "mixed"
+    clientMessageId: str = ""
+    content: str
+    actionCode: str = ""
+    actionParams: dict = Field(default_factory=dict)
+    attachmentIds: list[int] = Field(default_factory=list)
+
+
+def sse_event(event: str, data: dict) -> str:
+    payload = json.dumps(data, ensure_ascii=False)
+    print(f"[SSE] event={event} data={payload}", flush=True)
+    return f"event: {event}\ndata: {payload}\n\n"
+
+
+def local_todo_summary(page: int, limit: int) -> dict:
+    """后端接口不可达时的降级数据源：使用本地船舶任务数据统计待办。"""
+    status_counts: dict = {}
+    todo_list = []
+    task_id = 0
+    for name, s in SHIPS.items():
+        task_id += 1
+        mapped = STATUS_CODE_MAP.get(s["状态"])
+        if not mapped:
+            continue  # 已归档/已完成不计入待办
+        code, code_name = mapped
+        status_counts[code] = status_counts.get(code, 0) + 1
+        todo_list.append(
+            {
+                "taskId": task_id,
+                "taskNo": f"LOCAL-TASK-{task_id:04d}",
+                "shipId": task_id,
+                "shipName": name,
+                "ccsNo": s.get("CCSNO", ""),
+                "inspectionType": "annual" if s.get("检验类型") == "年度检验" else "special",
+                "inspectionTypeName": s.get("检验类型", ""),
+                "status": code,
+                "statusName": code_name,
+                "plannedInspectionDate": "",
+                "surveyorName": "张工",
+                "checkItemCount": len(s.get("检验项", [])),
+                "legacyItemCount": len(s.get("遗留复查项", [])),
+                "issueCount": len(
+                    [x for x in s.get("遗留复查项", []) if x.get("状态") == "未确认"]
+                ),
+                "progressPercent": 0,
+            }
+        )
+    total = len(todo_list)
+    start = (page - 1) * limit
+    return {
+        "todoTotal": total,
+        "statusCounts": status_counts,
+        "todoList": todo_list[start : start + limit],
+        "source": "local_ships",
+    }
+
+
+async def fetch_todo_summary(
+    client_type: str, page: int, limit: int, auth: str
+) -> dict:
+    """优先调用 5.5.5.45:8082 的任务列表/工作台汇总接口，失败时降级为本地数据。"""
+    headers = {"Accept": "application/json"}
+    if auth:
+        headers["Authorization"] = auth
+    async with httpx.AsyncClient(base_url=TODO_BACKEND_BASE, timeout=5) as client:
+        tasks_resp = await client.get(
+            "/api/ai/ship-tasks",
+            params={
+                "clientType": client_type,
+                "page": page,
+                "limit": limit,
+                "todoFilter": "all",
+            },
+            headers=headers,
+        )
+        tasks_resp.raise_for_status()
+        tasks_data = tasks_resp.json().get("data") or {}
+        result = {
+            "todoTotal": tasks_data.get("total"),
+            "statusCounts": {},
+            "todoList": tasks_data.get("list") or [],
+            "source": "ship_tasks",
+        }
+        try:
+            summary_resp = await client.get(
+                "/api/ai/workbench/summary",
+                params={"clientType": client_type},
+                headers=headers,
+            )
+            summary_resp.raise_for_status()
+            summary_data = summary_resp.json().get("data") or {}
+            result["statusCounts"] = summary_data.get("statusCounts") or {}
+            if result["todoTotal"] is None:
+                result["todoTotal"] = summary_data.get("todoTotal")
+                result["source"] = "workbench_summary"
+        except Exception as e:
+            print(f"[todo] 工作台汇总接口不可用: {e}", flush=True)
+        return result
+
+
+async def stream_classify(req: ClassifyRequest, auth: str) -> AsyncGenerator[str, None]:
+    request_id = str(uuid.uuid4())
+    session_id = req.sessionId or int(datetime.now().timestamp() * 1000)
+    turn_id = int(datetime.now().timestamp() * 1000) + 1
+    user_message_id = turn_id + 1
+    seq = 0
+
+    yield sse_event(
+        "message_start",
+        {
+            "requestId": request_id,
+            "sessionId": session_id,
+            "turnId": turn_id,
+            "userMessageId": user_message_id,
+            "assistantMessageId": None,
+            "status": "running",
+        },
+    )
+
+    page = int(req.actionParams.get("todoPage") or 1)
+    limit = int(req.actionParams.get("todoLimit") or 20)
+    try:
+        todo = await fetch_todo_summary(req.clientType, page, limit, auth)
+    except Exception as e:
+        print(f"[todo] 后端待办接口不可达（{TODO_BACKEND_BASE}），降级为本地数据: {e}", flush=True)
+        try:
+            todo = local_todo_summary(page, limit)
+        except Exception as e2:
+            print(f"[todo] 本地待办统计失败: {e2}", flush=True)
+            todo = None
+
+    seq += 1
+    if todo is None:
+        yield sse_event(
+            "answer_delta",
+            {
+                "seq": seq,
+                "type": "todo_summary",
+                "actionCode": "QUERY_MY_TODOS",
+                "actionName": "查询我的待办",
+                "content": "暂时无法获取待办统计，我继续为你处理问题。",
+                "todoTotal": None,
+                "todoPage": page,
+                "todoLimit": limit,
+                "statusCounts": {},
+                "todoList": [],
+                "source": "",
+            },
+        )
+    else:
+        total = todo["todoTotal"]
+        shown = len(todo["todoList"])
+        content = (
+            f"根据当前任务统计，你当前共有 {total} 项待办任务"
+            + (f"，下面是优先展示的 {shown} 条待办。" if shown else "。")
+            if total is not None
+            else "暂时无法获取待办统计，我继续为你处理问题。"
+        )
+        yield sse_event(
+            "answer_delta",
+            {
+                "seq": seq,
+                "type": "todo_summary",
+                "actionCode": "QUERY_MY_TODOS",
+                "actionName": "查询我的待办",
+                "content": content,
+                "todoTotal": total,
+                "todoPage": page,
+                "todoLimit": limit,
+                "statusCounts": todo["statusCounts"],
+                "todoList": todo["todoList"],
+                "source": todo["source"],
+            },
+        )
+
+    if req.actionCode:
+        yield sse_event(
+            "action_intent",
+            {"actionCode": req.actionCode, "actionName": "查询我的待办" if req.actionCode == "QUERY_MY_TODOS" else req.actionCode},
+        )
+        if req.actionCode == "QUERY_MY_TODOS" and todo is not None:
+            yield sse_event(
+                "action_result",
+                {
+                    "actionCode": "QUERY_MY_TODOS",
+                    "status": "success",
+                    "message": "查询成功",
+                    "payload": {
+                        "todoTotal": todo["todoTotal"],
+                        "todoList": todo["todoList"],
+                    },
+                },
+            )
+
+    status = "success"
+    try:
+        inputs = {"messages": [HumanMessage(content=req.content)]}
+        async for msg, meta in graph.astream(inputs, stream_mode="messages"):
+            node = meta.get("langgraph_node")
+            if node == "supervisor" or isinstance(msg, ToolMessage):
+                continue
+            if msg.content:
+                seq += 1
+                yield sse_event(
+                    "answer_delta",
+                    {"seq": seq, "type": "model_delta", "content": msg.content},
+                )
+    except Exception as e:
+        status = "error"
+        yield sse_event("error", {"requestId": request_id, "message": f"模型调用失败: {e}"})
+
+    if status == "success":
+        yield sse_event(
+            "message_end",
+            {
+                "requestId": request_id,
+                "sessionId": session_id,
+                "turnId": turn_id,
+                "userMessageId": user_message_id,
+                "assistantMessageId": user_message_id + 1,
+                "status": "success",
+                "actionCode": req.actionCode or "GENERAL_QA",
+            },
+        )
+
+
+@app.post("/api/ai/chat/classify")
+async def chat_classify(req: ClassifyRequest, request: Request):
+    auth = request.headers.get("Authorization", "")
+    return StreamingResponse(
+        stream_classify(req, auth),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+@app.post("/api/ai/chat/stop")
+async def chat_stop():
+    return {"status": "stopped"}
 
 
 # ==================== 页面数据接口：任务概览 / 检验项写回 ====================
