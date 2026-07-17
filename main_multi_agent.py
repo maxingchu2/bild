@@ -1272,6 +1272,254 @@ async def stream_delete_check_item(
         yield chunk
 
 
+# ==================== 保存检查项（SAVE_CHECK_ITEMS） ====================
+
+SAVE_CHECK_ITEMS_PATTERN = re.compile(
+    r"(保存|落库).{0,30}(检[验查]项|清单)|(检[验查]项|清单).{0,20}(保存|落库)"
+)
+
+
+def detect_save_check_items(req: ClassifyRequest) -> bool:
+    if req.actionCode == "SAVE_CHECK_ITEMS":
+        return True
+    if req.actionCode:
+        return False
+    text = req.content or ""
+    if not SAVE_CHECK_ITEMS_PATTERN.search(text):
+        return False
+    if re.search(r"如何|怎么|怎样|能不能|可以.*吗|？|\?", text):
+        return False
+    return True
+
+
+def normalize_check_list(raw) -> list:
+    """把 check_list（扁平列表或检查项树）归一化为扁平检查项列表。"""
+    flat = []
+    for entry in raw or []:
+        if not isinstance(entry, dict):
+            continue
+        if "sections" in entry:
+            for section in entry.get("sections") or []:
+                for item in section.get("items") or []:
+                    if isinstance(item, dict):
+                        flat.append(
+                            {
+                                **item,
+                                "disciplineCode": item.get("disciplineCode")
+                                or entry.get("disciplineCode"),
+                                "disciplineName": item.get("disciplineName")
+                                or entry.get("disciplineName"),
+                                "sectionName": item.get("sectionName")
+                                or section.get("sectionName"),
+                            }
+                        )
+        else:
+            flat.append(entry)
+    return flat
+
+
+def build_save_item_body(item: dict) -> dict:
+    body = {
+        "itemCode": item.get("itemCode") or "",
+        "itemName": item.get("itemName") or "",
+        "riskLevel": item.get("riskLevel") or "low",
+        "itemType": item.get("itemType") or "normal",
+        "source": "ai",
+    }
+    for key in (
+        "disciplineCode",
+        "disciplineName",
+        "sectionName",
+        "categoryName",
+        "regulationBasis",
+        "actionRequirement",
+    ):
+        if item.get(key):
+            body[key] = item[key]
+    return body
+
+
+async def stream_save_check_items(
+    req: ClassifyRequest, auth: str
+) -> AsyncGenerator[str, None]:
+    request_id = str(uuid.uuid4())
+    session_id = req.sessionId or int(datetime.now().timestamp() * 1000)
+    if isinstance(session_id, str) and session_id.isdigit():
+        session_id = int(session_id)
+    turn_id = int(datetime.now().timestamp() * 1000) + 1
+    user_message_id = turn_id + 1
+
+    yield sse_event(
+        "message_start",
+        {
+            "requestId": request_id,
+            "sessionId": session_id,
+            "turnId": turn_id,
+            "userMessageId": user_message_id,
+            "assistantMessageId": None,
+            "status": "running",
+        },
+    )
+
+    task_id = req.taskId
+    if isinstance(task_id, str) and task_id.isdigit():
+        task_id = int(task_id)
+    params = req.actionParams or {}
+    raw_list = params.get("check_list")
+    if raw_list is None:
+        raw_list = params.get("check_lsit")  # 兼容上游误传字段名
+
+    def base_delta(status: str, content: str) -> dict:
+        return {
+            "seq": 1,
+            "type": "action_result",
+            "actionCode": "SAVE_CHECK_ITEMS",
+            "actionName": "保存检查项",
+            "status": status,
+            "content": content,
+            "taskId": task_id,
+            "saveTotal": 0,
+            "successTotal": 0,
+            "failedTotal": 0,
+            "savedItems": [],
+            "failedItems": [],
+        }
+
+    async def finish(delta: dict, extra_action_result: dict | None = None):
+        yield sse_event("answer_delta", delta)
+        if extra_action_result is not None:
+            yield sse_event("action_result", extra_action_result)
+        yield sse_event(
+            "message_end",
+            {
+                "requestId": request_id,
+                "sessionId": session_id,
+                "turnId": turn_id,
+                "userMessageId": user_message_id,
+                "assistantMessageId": user_message_id + 1,
+                "status": "success",
+                "actionCode": "SAVE_CHECK_ITEMS",
+            },
+        )
+
+    if task_id in (None, ""):
+        delta = base_delta("rejected", "保存失败：该操作需要关联检验任务。")
+        async for chunk in finish(delta):
+            yield chunk
+        return
+    if raw_list is None:
+        delta = base_delta("rejected", "保存失败：缺少 check_list，无法保存检查项。")
+        async for chunk in finish(delta):
+            yield chunk
+        return
+
+    items = normalize_check_list(raw_list)
+    if not items:
+        delta = base_delta(
+            "rejected", "保存失败：check_list 为空，没有需要保存的检查项。"
+        )
+        async for chunk in finish(delta):
+            yield chunk
+        return
+
+    saved_items = []
+    failed_items = []
+    backend_available = True
+    for item in items:
+        body = build_save_item_body(item)
+        if not body["itemCode"]:
+            failed_items.append(
+                {
+                    "itemCode": body["itemCode"],
+                    "itemName": body["itemName"],
+                    "reason": "itemCode 不能为空",
+                }
+            )
+            continue
+        if not body["itemName"]:
+            failed_items.append(
+                {
+                    "itemCode": body["itemCode"],
+                    "itemName": body["itemName"],
+                    "reason": "itemName 不能为空",
+                }
+            )
+            continue
+        added = None
+        if backend_available:
+            try:
+                added = await add_check_item_backend(task_id, body, auth)
+            except (httpx.ConnectError, httpx.ConnectTimeout) as e:
+                print(
+                    f"[check-item] 后端新增接口不可达（{TODO_BACKEND_BASE}），降级为本地数据: {e}",
+                    flush=True,
+                )
+                backend_available = False
+            except Exception as e:
+                failed_items.append(
+                    {
+                        "itemCode": body["itemCode"],
+                        "itemName": body["itemName"],
+                        "reason": f"新增接口调用失败: {e}",
+                    }
+                )
+                continue
+        if not backend_available:
+            added = local_add_check_item(task_id, body)
+        saved_items.append(
+            {
+                "itemId": (added or {}).get("itemId"),
+                "itemCode": body["itemCode"],
+                "itemName": body["itemName"],
+            }
+        )
+
+    save_total = len(items)
+    success_total = len(saved_items)
+    failed_total = len(failed_items)
+    if success_total == 0:
+        status = "failed"
+        content = f"保存失败：{save_total} 条检查项均未保存成功。"
+    elif failed_total > 0:
+        status = "partial_success"
+        content = f"保存完成，成功新增 {success_total} 条，失败 {failed_total} 条。"
+    else:
+        status = "success"
+        content = f"保存成功，已新增 {success_total} 条检查项。"
+
+    delta = base_delta(status, content)
+    delta.update(
+        {
+            "saveTotal": save_total,
+            "successTotal": success_total,
+            "failedTotal": failed_total,
+            "savedItems": saved_items,
+            "failedItems": failed_items,
+            "refresh": ["checkItems", "overview"],
+            "source": "check_items_after_save"
+            if backend_available
+            else "local_check_items",
+        }
+    )
+    extra = None
+    if success_total > 0:
+        extra = {
+            "actionCode": "SAVE_CHECK_ITEMS",
+            "status": status,
+            "message": content,
+            "payload": {
+                "taskId": task_id,
+                "saveTotal": save_total,
+                "successTotal": success_total,
+                "failedTotal": failed_total,
+                "savedItems": saved_items,
+                "failedItems": failed_items,
+            },
+        }
+    async for chunk in finish(delta, extra):
+        yield chunk
+
+
 @app.post("/api/ai/chat/classify")
 async def chat_classify(request: Request):
     raw = await request.body()
@@ -1290,7 +1538,9 @@ async def chat_classify(request: Request):
         data = {}
     req = ClassifyRequest.model_validate(data)
     auth = request.headers.get("Authorization", "")
-    if detect_delete_check_item(req):
+    if detect_save_check_items(req):
+        stream = stream_save_check_items(req, auth)
+    elif detect_delete_check_item(req):
         stream = stream_delete_check_item(req, auth)
     elif detect_add_check_item(req):
         stream = stream_add_check_item(req, auth)
