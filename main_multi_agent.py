@@ -2468,6 +2468,223 @@ async def stream_view_check_items_overview(
         yield chunk
 
 
+# ==================== 问题记录（RECORD_ISSUE） ====================
+
+RECORD_ISSUE_PATTERN = re.compile(
+    r"发现.{0,20}(问题|缺陷|隐患|裂纹|松动|锈蚀|损坏)|"
+    r"(记录|报告|登记).{0,10}(一个|一条)?(问题|缺陷|隐患)|"
+    r"(这里|这个地方|此处).{0,5}有问题|有问题.{0,5}(要|需要)?(记录|上报)"
+)
+RECORD_ISSUE_EXCLUDE_PATTERN = re.compile(
+    r"如何|怎么|怎样|需要哪些|哪些信息|哪些步骤|是什么|什么是|什么意思|能不能|可以.*吗|？|\?|查看|想看|已记录|已经记录|列表|确认.{0,5}整改|关闭问题"
+)
+
+SEVERITY_NAMES = {"high": "高", "medium": "中", "low": "低"}
+SEVERITY_TEXT_MAP = [
+    (re.compile(r"严重程度[：: ]?[为是]?高|高风险|重大"), "high"),
+    (re.compile(r"严重程度[：: ]?[为是]?中|中等|一般"), "medium"),
+    (re.compile(r"严重程度[：: ]?[为是]?低|轻微|低风险"), "low"),
+]
+
+
+def detect_record_issue(req: ClassifyRequest) -> bool:
+    if req.actionCode == "RECORD_ISSUE":
+        return True
+    if req.actionCode:
+        return False
+    text = req.content or ""
+    if not RECORD_ISSUE_PATTERN.search(text):
+        return False
+    if RECORD_ISSUE_EXCLUDE_PATTERN.search(text):
+        return False
+    return True
+
+
+def parse_issue_params(content: str, params: dict) -> dict:
+    desc = (params.get("issueDescription") or "").strip()
+    severity = (params.get("severityLevel") or "").strip()
+    location = (params.get("location") or "").strip()
+    text = content or ""
+
+    if not desc:
+        m = re.search(
+            r"(?:发现|记录|报告|登记)(?:问题|一个问题|一条问题)?[：:，,]?\s*(.+)", text
+        )
+        if m:
+            desc = m.group(1).strip()
+            desc = re.split(r"[，,。；;]\s*(?:严重程度|位置)", desc)[0].strip()
+        if re.fullmatch(r"(一个|一条)?(问题|缺陷|隐患)?", desc):
+            desc = ""
+    if not severity:
+        for pattern, level in SEVERITY_TEXT_MAP:
+            if pattern.search(text):
+                severity = level
+                break
+    if not severity:
+        severity = "medium"
+    if not location:
+        m = re.search(r"位置(?:在|为|是)?[：:]?\s*([^，,。；;]+)", text)
+        if m:
+            location = m.group(1).strip()
+    return {
+        "issueDescription": desc,
+        "severityLevel": severity,
+        "location": location,
+        "photos": params.get("photos") or [],
+    }
+
+
+async def record_issue_backend(task_id, issue: dict, auth: str) -> dict:
+    async with httpx.AsyncClient(base_url=TODO_BACKEND_BASE, timeout=30) as client:
+        resp = await client.post(
+            f"/api/ai/ship-tasks/{task_id}/issues",
+            json={
+                "checkItemId": None,
+                "checkItemCode": None,
+                "checkItemName": None,
+                "severity": issue["severityLevel"],
+                "riskLevel": issue["severityLevel"],
+                "problemDesc": issue["issueDescription"],
+                "location": issue["location"],
+                "photos": issue["photos"],
+                "regulationBasis": "",
+                "rectificationAdvice": "",
+                "source": "ai",
+            },
+            headers=backend_headers(auth),
+        )
+        resp.raise_for_status()
+        return (resp.json() or {}).get("data") or {}
+
+
+LOCAL_ISSUE_ID_SEQ = {"value": 20000}
+
+
+def local_record_issue(issue: dict) -> dict:
+    LOCAL_ISSUE_ID_SEQ["value"] += 1
+    severity = issue["severityLevel"]
+    return {
+        "issueId": LOCAL_ISSUE_ID_SEQ["value"],
+        "problemDesc": issue["issueDescription"],
+        "severity": severity,
+        "severityName": SEVERITY_NAMES.get(severity, ""),
+        "location": issue["location"],
+        "riskLevel": severity,
+        "riskLevelName": SEVERITY_NAMES.get(severity, ""),
+        "status": "pending",
+    }
+
+
+async def stream_record_issue(
+    req: ClassifyRequest, auth: str
+) -> AsyncGenerator[str, None]:
+    request_id = str(uuid.uuid4())
+    session_id = req.sessionId or int(datetime.now().timestamp() * 1000)
+    if isinstance(session_id, str) and session_id.isdigit():
+        session_id = int(session_id)
+    turn_id = int(datetime.now().timestamp() * 1000) + 1
+    user_message_id = turn_id + 1
+
+    yield sse_event(
+        "message_start",
+        {
+            "requestId": request_id,
+            "sessionId": session_id,
+            "turnId": turn_id,
+            "userMessageId": user_message_id,
+            "assistantMessageId": None,
+            "status": "running",
+        },
+    )
+
+    task_id = req.taskId
+    if isinstance(task_id, str) and task_id.isdigit():
+        task_id = int(task_id)
+
+    def base_delta(status: str, content: str) -> dict:
+        return {
+            "seq": 1,
+            "type": "action_result",
+            "actionCode": "RECORD_ISSUE",
+            "actionName": "问题记录",
+            "status": status,
+            "content": content,
+            "taskId": task_id,
+            "issue": None,
+        }
+
+    async def finish(delta: dict, extra_action_result: dict | None = None):
+        yield sse_event("answer_delta", delta)
+        if extra_action_result is not None:
+            yield sse_event("action_result", extra_action_result)
+        yield sse_event(
+            "message_end",
+            {
+                "requestId": request_id,
+                "sessionId": session_id,
+                "turnId": turn_id,
+                "userMessageId": user_message_id,
+                "assistantMessageId": user_message_id + 1,
+                "status": "success",
+                "actionCode": "RECORD_ISSUE",
+            },
+        )
+
+    if task_id in (None, ""):
+        async for chunk in finish(
+            base_delta("rejected", "记录失败：该操作需要关联检验任务。")
+        ):
+            yield chunk
+        return
+
+    issue_params = parse_issue_params(req.content or "", req.actionParams or {})
+    if not issue_params["issueDescription"]:
+        async for chunk in finish(
+            base_delta("rejected", "记录失败：缺少问题描述，请补充问题详情。")
+        ):
+            yield chunk
+        return
+
+    source = "record_issue"
+    try:
+        issue = await record_issue_backend(task_id, issue_params, auth)
+        if not issue:
+            issue = local_record_issue(issue_params)
+    except (httpx.ConnectError, httpx.ConnectTimeout) as e:
+        print(
+            f"[issue] 后端问题记录接口不可达（{TODO_BACKEND_BASE}），降级为本地数据: {e}",
+            flush=True,
+        )
+        issue = local_record_issue(issue_params)
+        source = "local_record_issue"
+    except Exception as e:
+        print(f"[issue] 问题记录失败: {e}", flush=True)
+        async for chunk in finish(
+            base_delta("failed", "问题记录失败，请稍后重试。")
+        ):
+            yield chunk
+        return
+
+    delta = base_delta("success", "问题已记录成功。")
+    delta.update(
+        {
+            "issue": issue,
+            "refresh": ["issues", "overview"],
+            "source": source,
+        }
+    )
+    async for chunk in finish(
+        delta,
+        {
+            "actionCode": "RECORD_ISSUE",
+            "status": "success",
+            "message": "问题已记录",
+            "payload": {"taskId": task_id, "issue": issue},
+        },
+    ):
+        yield chunk
+
+
 # ==================== 确认整改遗留问题（CONFIRM_RECTIFICATION_ISSUES） ====================
 
 CONFIRM_RECTIFICATION_PATTERN = re.compile(
@@ -3007,6 +3224,8 @@ async def chat_classify(request: Request):
         stream = stream_complete_inspection(req, auth)
     elif detect_view_check_items_overview(req):
         stream = stream_view_check_items_overview(req, auth)
+    elif detect_record_issue(req):
+        stream = stream_record_issue(req, auth)
     elif detect_confirm_rectification(req):
         stream = stream_confirm_rectification(req, auth)
     elif detect_pending_rectification(req):
