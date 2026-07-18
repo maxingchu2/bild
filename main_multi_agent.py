@@ -2099,6 +2099,165 @@ async def stream_generate_work_log(
         yield chunk
 
 
+# ==================== 开始检验（START_INSPECTION） ====================
+
+START_INSPECTION_PATTERN = re.compile(
+    r"(开始|进入|打开).{0,10}(检验|验船)|我要检验|开始验船|检验流程|检验页面"
+)
+START_INSPECTION_EXCLUDE_PATTERN = re.compile(
+    r"如何|怎么|怎样|需要哪些|哪些步骤|是什么|什么是|能不能|可以.*吗|？|\?|查看|已经完成|已完成|推送|保存"
+)
+
+
+def detect_start_inspection(req: ClassifyRequest) -> bool:
+    if req.actionCode == "START_INSPECTION":
+        return True
+    if req.actionCode:
+        return False
+    text = req.content or ""
+    if not START_INSPECTION_PATTERN.search(text):
+        return False
+    if START_INSPECTION_EXCLUDE_PATTERN.search(text):
+        return False
+    return True
+
+
+async def fetch_inspection_tasks(client_type: str, auth: str) -> list:
+    async with httpx.AsyncClient(base_url=TODO_BACKEND_BASE, timeout=10) as client:
+        resp = await client.get(
+            "/api/ai/ship-tasks",
+            params={
+                "clientType": client_type,
+                "status": "pending_inspection,inspection",
+                "page": 1,
+                "limit": 20,
+            },
+            headers=backend_headers(auth),
+        )
+        resp.raise_for_status()
+        data = (resp.json() or {}).get("data") or {}
+        return data.get("list") or []
+
+
+def local_inspection_tasks() -> list:
+    tasks = []
+    task_id = 0
+    for name, s in SHIPS.items():
+        task_id += 1
+        mapped = STATUS_CODE_MAP.get(s["状态"])
+        if not mapped or mapped[0] not in ("pending_inspection", "inspection"):
+            continue
+        code, code_name = mapped
+        tasks.append(
+            {
+                "taskId": task_id,
+                "taskNo": f"LOCAL-TASK-{task_id:04d}",
+                "shipName": name,
+                "ccsNo": s.get("CCSNO", ""),
+                "status": code,
+                "statusName": code_name,
+                "plannedInspectionDate": "",
+                "surveyorName": "张工",
+                "progressPercent": 0,
+            }
+        )
+    return tasks
+
+
+async def stream_start_inspection(
+    req: ClassifyRequest, auth: str
+) -> AsyncGenerator[str, None]:
+    request_id = str(uuid.uuid4())
+    session_id = req.sessionId or int(datetime.now().timestamp() * 1000)
+    if isinstance(session_id, str) and session_id.isdigit():
+        session_id = int(session_id)
+    turn_id = int(datetime.now().timestamp() * 1000) + 1
+    user_message_id = turn_id + 1
+
+    yield sse_event(
+        "message_start",
+        {
+            "requestId": request_id,
+            "sessionId": session_id,
+            "turnId": turn_id,
+            "userMessageId": user_message_id,
+            "assistantMessageId": None,
+            "status": "running",
+        },
+    )
+
+    def base_delta(status: str, content: str) -> dict:
+        return {
+            "seq": 1,
+            "type": "action_result",
+            "actionCode": "START_INSPECTION",
+            "actionName": "开始检验",
+            "status": status,
+            "content": content,
+            "taskList": None,
+        }
+
+    async def finish(delta: dict, extra_action_result: dict | None = None):
+        yield sse_event("answer_delta", delta)
+        if extra_action_result is not None:
+            yield sse_event("action_result", extra_action_result)
+        yield sse_event(
+            "message_end",
+            {
+                "requestId": request_id,
+                "sessionId": session_id,
+                "turnId": turn_id,
+                "userMessageId": user_message_id,
+                "assistantMessageId": user_message_id + 1,
+                "status": "success",
+                "actionCode": "START_INSPECTION",
+            },
+        )
+
+    source = "start_inspection"
+    try:
+        task_list = await fetch_inspection_tasks(req.clientType or "pc", auth)
+    except (httpx.ConnectError, httpx.ConnectTimeout) as e:
+        print(
+            f"[inspection] 后端任务列表接口不可达（{TODO_BACKEND_BASE}），降级为本地数据: {e}",
+            flush=True,
+        )
+        task_list = local_inspection_tasks()
+        source = "local_ships"
+    except Exception as e:
+        print(f"[inspection] 任务列表查询失败: {e}", flush=True)
+        async for chunk in finish(
+            base_delta("failed", "获取任务列表失败，请稍后重试。")
+        ):
+            yield chunk
+        return
+
+    count = len(task_list)
+    content = (
+        f"已为您找到 {count} 项待检验和检验中的任务，请选择要检验的任务。"
+        if count
+        else "当前没有待检验或检验中的任务。"
+    )
+    delta = base_delta("success", content)
+    delta.update(
+        {
+            "taskList": task_list,
+            "refresh": ["inspectionTaskList", "overview"],
+            "source": source,
+        }
+    )
+    async for chunk in finish(
+        delta,
+        {
+            "actionCode": "START_INSPECTION",
+            "status": "success",
+            "message": "查询成功",
+            "payload": {"taskTotal": count, "taskList": task_list},
+        },
+    ):
+        yield chunk
+
+
 @app.post("/api/ai/chat/classify")
 async def chat_classify(request: Request):
     raw = await request.body()
@@ -2117,7 +2276,9 @@ async def chat_classify(request: Request):
         data = {}
     req = ClassifyRequest.model_validate(data)
     auth = request.headers.get("Authorization", "")
-    if detect_generate_work_log(req):
+    if detect_start_inspection(req):
+        stream = stream_start_inspection(req, auth)
+    elif detect_generate_work_log(req):
         stream = stream_generate_work_log(req, auth)
     elif detect_upload_material(req):
         stream = stream_upload_material(req, auth)
