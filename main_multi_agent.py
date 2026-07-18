@@ -1956,6 +1956,149 @@ async def stream_upload_material(
         yield chunk
 
 
+# ==================== 生成工作日志（GENERATE_WORK_LOG） ====================
+
+GENERATE_WORK_LOG_PATTERN = re.compile(
+    r"生成.{0,20}(工作日志|检验日志|日志|工作记录)|(工作日志|检验日志|日志|工作记录).{0,10}生成|(检[验查]内容|检[验查]项).{0,10}生成一?份?(工作日志|检验日志|日志)"
+)
+
+LOCAL_WORK_LOG_DOC_SEQ = {"value": 83000}
+
+
+def detect_generate_work_log(req: ClassifyRequest) -> bool:
+    if req.actionCode == "GENERATE_WORK_LOG":
+        return True
+    if req.actionCode:
+        return False
+    text = req.content or ""
+    if not GENERATE_WORK_LOG_PATTERN.search(text):
+        return False
+    if GENERATE_FORM_EXCLUDE_PATTERN.search(text):
+        return False
+    return True
+
+
+async def generate_work_log_backend(task_id, auth: str) -> dict:
+    async with httpx.AsyncClient(base_url=TODO_BACKEND_BASE, timeout=30) as client:
+        resp = await client.post(
+            f"/api/ai/ship-tasks/{task_id}/work-log/generate",
+            headers=backend_headers(auth),
+        )
+        resp.raise_for_status()
+        return (resp.json() or {}).get("data") or {}
+
+
+def local_generate_work_log(task_id) -> dict:
+    LOCAL_WORK_LOG_DOC_SEQ["value"] += 1
+    return {
+        "docId": LOCAL_WORK_LOG_DOC_SEQ["value"],
+        "docNo": f"WL-{task_id}-{datetime.now().strftime('%Y%m%d')}",
+        "versionNo": 1,
+        "status": "generated",
+        "viewType": "surveyor",
+    }
+
+
+async def stream_generate_work_log(
+    req: ClassifyRequest, auth: str
+) -> AsyncGenerator[str, None]:
+    request_id = str(uuid.uuid4())
+    session_id = req.sessionId or int(datetime.now().timestamp() * 1000)
+    if isinstance(session_id, str) and session_id.isdigit():
+        session_id = int(session_id)
+    turn_id = int(datetime.now().timestamp() * 1000) + 1
+    user_message_id = turn_id + 1
+
+    yield sse_event(
+        "message_start",
+        {
+            "requestId": request_id,
+            "sessionId": session_id,
+            "turnId": turn_id,
+            "userMessageId": user_message_id,
+            "assistantMessageId": None,
+            "status": "running",
+        },
+    )
+
+    task_id = req.taskId
+    if isinstance(task_id, str) and task_id.isdigit():
+        task_id = int(task_id)
+
+    def base_delta(status: str, content: str) -> dict:
+        return {
+            "seq": 1,
+            "type": "action_result",
+            "actionCode": "GENERATE_WORK_LOG",
+            "actionName": "生成工作日志",
+            "status": status,
+            "content": content,
+            "taskId": task_id,
+            "workLog": None,
+        }
+
+    async def finish(delta: dict, extra_action_result: dict | None = None):
+        yield sse_event("answer_delta", delta)
+        if extra_action_result is not None:
+            yield sse_event("action_result", extra_action_result)
+        yield sse_event(
+            "message_end",
+            {
+                "requestId": request_id,
+                "sessionId": session_id,
+                "turnId": turn_id,
+                "userMessageId": user_message_id,
+                "assistantMessageId": user_message_id + 1,
+                "status": "success",
+                "actionCode": "GENERATE_WORK_LOG",
+            },
+        )
+
+    if task_id in (None, ""):
+        async for chunk in finish(
+            base_delta("rejected", "生成失败：该操作需要关联检验任务。")
+        ):
+            yield chunk
+        return
+
+    source = "generate_work_log"
+    try:
+        work_log = await generate_work_log_backend(task_id, auth)
+    except (httpx.ConnectError, httpx.ConnectTimeout) as e:
+        print(
+            f"[work-log] 后端生成接口不可达（{TODO_BACKEND_BASE}），降级为本地数据: {e}",
+            flush=True,
+        )
+        work_log = local_generate_work_log(task_id)
+        source = "local_work_log"
+    except Exception as e:
+        print(f"[work-log] 工作日志生成失败: {e}", flush=True)
+        async for chunk in finish(
+            base_delta("failed", "工作日志生成失败，请稍后重试。")
+        ):
+            yield chunk
+        return
+
+    delta = base_delta("success", "工作日志已生成，可进入预览页面查看。")
+    delta.update(
+        {
+            "workLog": work_log or None,
+            "refresh": ["workLogDocument", "overview"],
+            "source": source,
+        }
+    )
+    async for chunk in finish(
+        delta,
+        {
+            "actionCode": "GENERATE_WORK_LOG",
+            "status": "success",
+            "message": "工作日志已生成",
+            "payload": {"taskId": task_id, "workLog": work_log or None},
+        },
+    ):
+        yield chunk
+
+
 @app.post("/api/ai/chat/classify")
 async def chat_classify(request: Request):
     raw = await request.body()
@@ -1974,7 +2117,9 @@ async def chat_classify(request: Request):
         data = {}
     req = ClassifyRequest.model_validate(data)
     auth = request.headers.get("Authorization", "")
-    if detect_upload_material(req):
+    if detect_generate_work_log(req):
+        stream = stream_generate_work_log(req, auth)
+    elif detect_upload_material(req):
         stream = stream_upload_material(req, auth)
     elif detect_generate_ra_report(req):
         stream = stream_generate_ra_report(req, auth)
