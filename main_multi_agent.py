@@ -2099,6 +2099,168 @@ async def stream_generate_work_log(
         yield chunk
 
 
+# ==================== 查看检验项概览（VIEW_CHECK_ITEMS_OVERVIEW） ====================
+
+VIEW_CHECK_OVERVIEW_PATTERN = re.compile(
+    r"(查看|看看|看一下|统计).{0,15}(检[验查]项|检查项)(概览|统计|列表|树|数量)?|"
+    r"(检[验查]项|检查项).{0,10}(概览|统计|列表|树|数量)"
+)
+VIEW_CHECK_OVERVIEW_EXCLUDE_PATTERN = re.compile(
+    r"如何|怎么|怎样|需要哪些|哪些步骤|是什么|什么是|什么意思|能不能|可以.*吗|？|\?|新增|添加|删除|保存|报告|日志|检验单"
+)
+
+
+def detect_view_check_items_overview(req: ClassifyRequest) -> bool:
+    if req.actionCode == "VIEW_CHECK_ITEMS_OVERVIEW":
+        return True
+    if req.actionCode:
+        return False
+    text = req.content or ""
+    if not VIEW_CHECK_OVERVIEW_PATTERN.search(text):
+        return False
+    if VIEW_CHECK_OVERVIEW_EXCLUDE_PATTERN.search(text):
+        return False
+    return True
+
+
+async def fetch_task_overview(task_id, auth: str) -> dict:
+    async with httpx.AsyncClient(base_url=TODO_BACKEND_BASE, timeout=10) as client:
+        resp = await client.get(
+            f"/api/ai/ship-tasks/{task_id}/overview",
+            headers=backend_headers(auth),
+        )
+        resp.raise_for_status()
+        return (resp.json() or {}).get("data") or {}
+
+
+def local_task_overview(task_id, tree: list) -> dict:
+    flat = flatten_check_item_tree(tree)
+    completed = sum(1 for i in flat if i.get("status") == "completed")
+    rejected = sum(1 for i in flat if i.get("status") == "rejected")
+    pending = sum(1 for i in flat if i.get("status") not in ("completed", "rejected"))
+    return {
+        "checkItemCount": len(flat),
+        "completedCount": completed,
+        "pendingCount": pending,
+        "rejectedCount": rejected,
+        "legacyItemCount": 0,
+        "issueCount": 0,
+    }
+
+
+async def stream_view_check_items_overview(
+    req: ClassifyRequest, auth: str
+) -> AsyncGenerator[str, None]:
+    request_id = str(uuid.uuid4())
+    session_id = req.sessionId or int(datetime.now().timestamp() * 1000)
+    if isinstance(session_id, str) and session_id.isdigit():
+        session_id = int(session_id)
+    turn_id = int(datetime.now().timestamp() * 1000) + 1
+    user_message_id = turn_id + 1
+
+    yield sse_event(
+        "message_start",
+        {
+            "requestId": request_id,
+            "sessionId": session_id,
+            "turnId": turn_id,
+            "userMessageId": user_message_id,
+            "assistantMessageId": None,
+            "status": "running",
+        },
+    )
+
+    task_id = req.taskId
+    if isinstance(task_id, str) and task_id.isdigit():
+        task_id = int(task_id)
+
+    def base_delta(status: str, content: str) -> dict:
+        return {
+            "seq": 1,
+            "type": "action_result",
+            "actionCode": "VIEW_CHECK_ITEMS_OVERVIEW",
+            "actionName": "查看检验项概览",
+            "status": status,
+            "content": content,
+            "taskId": task_id,
+            "overview": None,
+            "checkItemTree": [],
+        }
+
+    async def finish(delta: dict, extra_action_result: dict | None = None):
+        yield sse_event("answer_delta", delta)
+        if extra_action_result is not None:
+            yield sse_event("action_result", extra_action_result)
+        yield sse_event(
+            "message_end",
+            {
+                "requestId": request_id,
+                "sessionId": session_id,
+                "turnId": turn_id,
+                "userMessageId": user_message_id,
+                "assistantMessageId": user_message_id + 1,
+                "status": "success",
+                "actionCode": "VIEW_CHECK_ITEMS_OVERVIEW",
+            },
+        )
+
+    if task_id in (None, ""):
+        async for chunk in finish(
+            base_delta("rejected", "查询失败：该操作需要关联检验任务。")
+        ):
+            yield chunk
+        return
+
+    source = "view_check_items_overview"
+    try:
+        overview = await fetch_task_overview(task_id, auth)
+        tree = await fetch_check_item_tree(task_id, auth)
+    except (httpx.ConnectError, httpx.ConnectTimeout) as e:
+        print(
+            f"[overview] 后端概览接口不可达（{TODO_BACKEND_BASE}），降级为本地数据: {e}",
+            flush=True,
+        )
+        tree = local_check_item_tree(task_id)
+        overview = local_task_overview(task_id, tree)
+        source = "local_check_items"
+    except Exception as e:
+        print(f"[overview] 检验项概览查询失败: {e}", flush=True)
+        async for chunk in finish(
+            base_delta("failed", "检验项概览查询失败，请稍后重试。")
+        ):
+            yield chunk
+        return
+
+    count = overview.get("checkItemCount")
+    if count is None:
+        count = len(flatten_check_item_tree(tree))
+    delta = base_delta(
+        "success", f"已为您查询到当前任务的检验项概览，共 {count} 条检查项。"
+    )
+    delta.update(
+        {
+            "overview": overview or None,
+            "checkItemTree": tree,
+            "refresh": ["checkItemOverview", "checkItemTree"],
+            "source": source,
+        }
+    )
+    async for chunk in finish(
+        delta,
+        {
+            "actionCode": "VIEW_CHECK_ITEMS_OVERVIEW",
+            "status": "success",
+            "message": "检验项概览查询成功",
+            "payload": {
+                "taskId": task_id,
+                "overview": overview or None,
+                "checkItemTree": tree,
+            },
+        },
+    ):
+        yield chunk
+
+
 # ==================== 未整改遗留问题（PENDING_RECTIFICATION_ISSUES） ====================
 
 PENDING_RECTIFICATION_PATTERN = re.compile(
@@ -2455,7 +2617,9 @@ async def chat_classify(request: Request):
         data = {}
     req = ClassifyRequest.model_validate(data)
     auth = request.headers.get("Authorization", "")
-    if detect_pending_rectification(req):
+    if detect_view_check_items_overview(req):
+        stream = stream_view_check_items_overview(req, auth)
+    elif detect_pending_rectification(req):
         stream = stream_pending_rectification(req, auth)
     elif detect_start_inspection(req):
         stream = stream_start_inspection(req, auth)
