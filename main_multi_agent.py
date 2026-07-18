@@ -2099,6 +2099,213 @@ async def stream_generate_work_log(
         yield chunk
 
 
+# ==================== 完成检验任务（COMPLETE_INSPECTION_TASK） ====================
+
+COMPLETE_INSPECTION_PATTERN = re.compile(
+    r"(完成|结束|关闭).{0,10}(检验|验船)|检验.{0,6}(完成|结束|关闭)|(完成|结束)现场检验"
+)
+COMPLETE_INSPECTION_EXCLUDE_PATTERN = re.compile(
+    r"如何|怎么|怎样|需要哪些|哪些步骤|是什么|什么是|什么意思|能不能|可以.*吗|？|\?|查看|想看|已经完成|已完成|生成|报告|保存|推送"
+)
+
+
+def detect_complete_inspection(req: ClassifyRequest) -> bool:
+    if req.actionCode == "COMPLETE_INSPECTION_TASK":
+        return True
+    if req.actionCode:
+        return False
+    text = req.content or ""
+    if not COMPLETE_INSPECTION_PATTERN.search(text):
+        return False
+    if COMPLETE_INSPECTION_EXCLUDE_PATTERN.search(text):
+        return False
+    return True
+
+
+async def close_check_backend(task_id, auth: str) -> dict:
+    async with httpx.AsyncClient(base_url=TODO_BACKEND_BASE, timeout=30) as client:
+        resp = await client.post(
+            f"/api/ai/ship-tasks/{task_id}/close-check",
+            headers=backend_headers(auth),
+        )
+        resp.raise_for_status()
+        return (resp.json() or {}).get("data") or {}
+
+
+async def close_task_backend(task_id, auth: str) -> dict:
+    async with httpx.AsyncClient(base_url=TODO_BACKEND_BASE, timeout=30) as client:
+        resp = await client.post(
+            f"/api/ai/ship-tasks/{task_id}/close",
+            headers=backend_headers(auth),
+        )
+        resp.raise_for_status()
+        return (resp.json() or {}).get("data") or {}
+
+
+async def fetch_legacy_items(task_id, auth: str) -> list:
+    async with httpx.AsyncClient(base_url=TODO_BACKEND_BASE, timeout=10) as client:
+        resp = await client.get(
+            f"/api/ai/ship-tasks/{task_id}/legacy-items",
+            headers=backend_headers(auth),
+        )
+        resp.raise_for_status()
+        data = (resp.json() or {}).get("data")
+        if isinstance(data, dict):
+            return data.get("list") or []
+        return data or []
+
+
+def local_complete_inspection(task_id) -> tuple[dict, dict]:
+    tree = local_check_item_tree(task_id)
+    overview = local_task_overview(task_id, tree)
+    task_detail = {
+        "taskNo": f"LOCAL-TASK-{task_id}",
+        "shipName": "本地测试船舶",
+        "status": "archive",
+        "statusName": "待归档",
+    }
+    return overview, task_detail
+
+
+async def stream_complete_inspection(
+    req: ClassifyRequest, auth: str
+) -> AsyncGenerator[str, None]:
+    request_id = str(uuid.uuid4())
+    session_id = req.sessionId or int(datetime.now().timestamp() * 1000)
+    if isinstance(session_id, str) and session_id.isdigit():
+        session_id = int(session_id)
+    turn_id = int(datetime.now().timestamp() * 1000) + 1
+    user_message_id = turn_id + 1
+
+    yield sse_event(
+        "message_start",
+        {
+            "requestId": request_id,
+            "sessionId": session_id,
+            "turnId": turn_id,
+            "userMessageId": user_message_id,
+            "assistantMessageId": None,
+            "status": "running",
+        },
+    )
+
+    task_id = req.taskId
+    if isinstance(task_id, str) and task_id.isdigit():
+        task_id = int(task_id)
+
+    def base_delta(status: str, content: str) -> dict:
+        return {
+            "seq": 1,
+            "type": "action_result",
+            "actionCode": "COMPLETE_INSPECTION_TASK",
+            "actionName": "完成检验任务",
+            "status": status,
+            "content": content,
+            "taskId": task_id,
+            "overview": None,
+        }
+
+    async def finish(delta: dict, extra_action_result: dict | None = None):
+        yield sse_event("answer_delta", delta)
+        if extra_action_result is not None:
+            yield sse_event("action_result", extra_action_result)
+        yield sse_event(
+            "message_end",
+            {
+                "requestId": request_id,
+                "sessionId": session_id,
+                "turnId": turn_id,
+                "userMessageId": user_message_id,
+                "assistantMessageId": user_message_id + 1,
+                "status": "success",
+                "actionCode": "COMPLETE_INSPECTION_TASK",
+            },
+        )
+
+    if task_id in (None, ""):
+        async for chunk in finish(
+            base_delta("rejected", "完成失败：该操作需要关联检验任务。")
+        ):
+            yield chunk
+        return
+
+    source = "complete_inspection_task"
+    overview = None
+    task_detail = None
+    try:
+        check_result = await close_check_backend(task_id, auth)
+        try:
+            overview = await fetch_task_overview(task_id, auth)
+        except Exception as e:
+            print(f"[complete] 检验项统计查询失败: {e}", flush=True)
+        try:
+            legacy_items = await fetch_legacy_items(task_id, auth)
+            if overview is not None and "legacyItemCount" not in overview:
+                overview["legacyItemCount"] = len(legacy_items)
+        except Exception as e:
+            print(f"[complete] 问题记录统计查询失败: {e}", flush=True)
+
+        passed = check_result.get("passed")
+        if passed is None:
+            passed = check_result.get("canClose", True)
+        if not passed:
+            reason = check_result.get("reason") or check_result.get("message") or ""
+            if "签署" in reason:
+                content = "完成失败：校验未通过，尚未完成检验签署。"
+            elif reason:
+                content = f"完成失败：校验未通过，{reason}"
+            else:
+                content = "完成失败：校验未通过，仍有遗留问题未确认。"
+            delta = base_delta("rejected", content)
+            delta.update(
+                {"overview": overview, "refresh": ["overview"], "source": source}
+            )
+            async for chunk in finish(delta):
+                yield chunk
+            return
+
+        close_result = await close_task_backend(task_id, auth)
+        task_detail = close_result.get("taskDetail") or close_result or None
+    except (httpx.ConnectError, httpx.ConnectTimeout) as e:
+        print(
+            f"[complete] 后端完成检验接口不可达（{TODO_BACKEND_BASE}），降级为本地数据: {e}",
+            flush=True,
+        )
+        overview, task_detail = local_complete_inspection(task_id)
+        source = "local_complete_inspection"
+    except Exception as e:
+        print(f"[complete] 检验任务完成失败: {e}", flush=True)
+        async for chunk in finish(
+            base_delta("failed", "检验任务完成失败，请稍后重试。")
+        ):
+            yield chunk
+        return
+
+    delta = base_delta("success", "检验任务已完成，资料已进入归档阶段。")
+    delta.update(
+        {
+            "overview": overview,
+            "taskDetail": task_detail,
+            "refresh": ["taskStatus", "overview", "archive"],
+            "source": source,
+        }
+    )
+    async for chunk in finish(
+        delta,
+        {
+            "actionCode": "COMPLETE_INSPECTION_TASK",
+            "status": "success",
+            "message": "检验任务已完成",
+            "payload": {
+                "taskId": task_id,
+                "overview": overview,
+                "taskDetail": task_detail,
+            },
+        },
+    ):
+        yield chunk
+
+
 # ==================== 查看检验项概览（VIEW_CHECK_ITEMS_OVERVIEW） ====================
 
 VIEW_CHECK_OVERVIEW_PATTERN = re.compile(
@@ -2617,7 +2824,9 @@ async def chat_classify(request: Request):
         data = {}
     req = ClassifyRequest.model_validate(data)
     auth = request.headers.get("Authorization", "")
-    if detect_view_check_items_overview(req):
+    if detect_complete_inspection(req):
+        stream = stream_complete_inspection(req, auth)
+    elif detect_view_check_items_overview(req):
         stream = stream_view_check_items_overview(req, auth)
     elif detect_pending_rectification(req):
         stream = stream_pending_rectification(req, auth)
