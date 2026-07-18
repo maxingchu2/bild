@@ -2099,6 +2099,185 @@ async def stream_generate_work_log(
         yield chunk
 
 
+# ==================== 未整改遗留问题（PENDING_RECTIFICATION_ISSUES） ====================
+
+PENDING_RECTIFICATION_PATTERN = re.compile(
+    r"(标记|设置|记录)?.{0,10}(未整改|没整改|还没整改|没有整改|未完成整改|无法整改)|"
+    r"未整改.{0,10}(遗留|问题)|(遗留问题|遗留项).{0,15}(未整改|没整改|还没整改|无法整改)"
+)
+PENDING_RECTIFICATION_EXCLUDE_PATTERN = re.compile(
+    r"如何|怎么|怎样|需要哪些|哪些步骤|是什么|什么是|什么意思|能不能|可以.*吗|？|\?|查看|想看|列表|确认整改|整改完成|新增遗留"
+)
+
+
+def detect_pending_rectification(req: ClassifyRequest) -> bool:
+    if req.actionCode == "PENDING_RECTIFICATION_ISSUES":
+        return True
+    if req.actionCode:
+        return False
+    text = req.content or ""
+    if not PENDING_RECTIFICATION_PATTERN.search(text):
+        return False
+    if PENDING_RECTIFICATION_EXCLUDE_PATTERN.search(text):
+        return False
+    return True
+
+
+async def pending_rectification_backend(
+    task_id, issue_ids: list, reason: str, auth: str
+) -> dict:
+    async with httpx.AsyncClient(base_url=TODO_BACKEND_BASE, timeout=30) as client:
+        resp = await client.post(
+            f"/api/ai/ship-tasks/{task_id}/legacy-items/batch-confirm",
+            json={
+                "legacyItemIds": issue_ids,
+                "status": "unconfirmed",
+                "remark": reason or "",
+                "source": "ai",
+            },
+            headers=backend_headers(auth),
+        )
+        resp.raise_for_status()
+        return (resp.json() or {}).get("data") or {}
+
+
+def local_pending_rectification(issue_ids: list, reason: str) -> list:
+    return [
+        {
+            "legacyItemId": issue_id,
+            "legacyCode": f"LEG-{issue_id}",
+            "title": f"遗留问题 {issue_id}",
+            "confirmStatus": "unconfirmed",
+            "confirmRemark": reason or "",
+        }
+        for issue_id in issue_ids
+    ]
+
+
+async def stream_pending_rectification(
+    req: ClassifyRequest, auth: str
+) -> AsyncGenerator[str, None]:
+    request_id = str(uuid.uuid4())
+    session_id = req.sessionId or int(datetime.now().timestamp() * 1000)
+    if isinstance(session_id, str) and session_id.isdigit():
+        session_id = int(session_id)
+    turn_id = int(datetime.now().timestamp() * 1000) + 1
+    user_message_id = turn_id + 1
+
+    yield sse_event(
+        "message_start",
+        {
+            "requestId": request_id,
+            "sessionId": session_id,
+            "turnId": turn_id,
+            "userMessageId": user_message_id,
+            "assistantMessageId": None,
+            "status": "running",
+        },
+    )
+
+    task_id = req.taskId
+    if isinstance(task_id, str) and task_id.isdigit():
+        task_id = int(task_id)
+
+    def base_delta(status: str, content: str) -> dict:
+        return {
+            "seq": 1,
+            "type": "action_result",
+            "actionCode": "PENDING_RECTIFICATION_ISSUES",
+            "actionName": "未整改遗留问题",
+            "status": status,
+            "content": content,
+            "taskId": task_id,
+            "pendingCount": 0,
+            "pendingItems": [],
+        }
+
+    async def finish(delta: dict, extra_action_result: dict | None = None):
+        yield sse_event("answer_delta", delta)
+        if extra_action_result is not None:
+            yield sse_event("action_result", extra_action_result)
+        yield sse_event(
+            "message_end",
+            {
+                "requestId": request_id,
+                "sessionId": session_id,
+                "turnId": turn_id,
+                "userMessageId": user_message_id,
+                "assistantMessageId": user_message_id + 1,
+                "status": "success",
+                "actionCode": "PENDING_RECTIFICATION_ISSUES",
+            },
+        )
+
+    if task_id in (None, ""):
+        async for chunk in finish(
+            base_delta("rejected", "标记失败：该操作需要关联检验任务。")
+        ):
+            yield chunk
+        return
+
+    params = req.actionParams or {}
+    issue_ids = params.get("issueIds") or []
+    if not isinstance(issue_ids, list):
+        issue_ids = [issue_ids]
+    issue_ids = [int(i) if isinstance(i, str) and i.isdigit() else i for i in issue_ids]
+    reason = params.get("pendingReason") or ""
+
+    if not issue_ids:
+        async for chunk in finish(
+            base_delta("rejected", "标记失败：缺少需要标记的遗留项ID列表。")
+        ):
+            yield chunk
+        return
+
+    source = "pending_rectification_issues"
+    try:
+        result = await pending_rectification_backend(task_id, issue_ids, reason, auth)
+        pending_items = result.get("list") or result.get("items") or []
+        if not pending_items:
+            pending_items = local_pending_rectification(issue_ids, reason)
+    except (httpx.ConnectError, httpx.ConnectTimeout) as e:
+        print(
+            f"[legacy] 后端标记接口不可达（{TODO_BACKEND_BASE}），降级为本地数据: {e}",
+            flush=True,
+        )
+        pending_items = local_pending_rectification(issue_ids, reason)
+        source = "local_pending_rectification"
+    except Exception as e:
+        print(f"[legacy] 遗留问题标记未整改失败: {e}", flush=True)
+        async for chunk in finish(
+            base_delta("failed", "遗留问题标记未整改失败，请稍后重试。")
+        ):
+            yield chunk
+        return
+
+    count = len(pending_items)
+    delta = base_delta("success", f"已标记 {count} 项遗留问题为未整改。")
+    delta.update(
+        {
+            "pendingCount": count,
+            "pendingItems": pending_items,
+            "refresh": ["legacyItems", "overview"],
+            "source": source,
+        }
+    )
+    async for chunk in finish(
+        delta,
+        {
+            "actionCode": "PENDING_RECTIFICATION_ISSUES",
+            "status": "success",
+            "message": "遗留问题已标记为未整改",
+            "payload": {
+                "taskId": task_id,
+                "pendingCount": count,
+                "pendingItems": pending_items,
+            },
+        },
+    ):
+        yield chunk
+
+
 # ==================== 开始检验（START_INSPECTION） ====================
 
 START_INSPECTION_PATTERN = re.compile(
@@ -2276,7 +2455,9 @@ async def chat_classify(request: Request):
         data = {}
     req = ClassifyRequest.model_validate(data)
     auth = request.headers.get("Authorization", "")
-    if detect_start_inspection(req):
+    if detect_pending_rectification(req):
+        stream = stream_pending_rectification(req, auth)
+    elif detect_start_inspection(req):
         stream = stream_start_inspection(req, auth)
     elif detect_generate_work_log(req):
         stream = stream_generate_work_log(req, auth)
