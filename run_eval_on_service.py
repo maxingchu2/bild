@@ -4,11 +4,15 @@
 调用现有 AI 对话流式接口 POST /api/ai/chat/classify，把每次请求/SSE 响应
 记录为 OpenTelemetry GenAI 格式的 Trace 日志，再用 eval_prototype 评测。
 
-用法:
-  python run_eval_on_service.py                          # 使用内置用例，服务地址默认 http://127.0.0.1:8000
-  python run_eval_on_service.py --base http://IP:8000    # 指定服务地址
-  python run_eval_on_service.py --base http://IP:8000 --auth "Bearer xxx"
-  python run_eval_on_service.py --cases my_cases.json    # 自定义测试用例
+用法（一条命令即可）:
+  python run_eval_on_service.py
+
+配置优先级: 命令行参数 > eval_config.json > 内置默认值。
+将服务地址/token/用例写入 eval_config.json 后，直接运行即可，例如:
+  {"base": "http://127.0.0.1:8000", "auth": "Bearer xxx", "cases": [...]}
+cases 省略时使用内置全动作用例（覆盖全部已实现的固定操作）。
+也支持命令行覆盖:
+  python run_eval_on_service.py --base http://IP:8000 --auth "Bearer xxx" --cases my_cases.json
 
 输出:
   eval_out/trace_<n>.json / declaration_<n>.json         # 每个用例的日志与证据说明表
@@ -25,45 +29,66 @@ import httpx
 
 import eval_prototype as ep
 
-# ==================== 内置测试用例（针对船检智能体服务） ====================
+# ==================== 内置测试用例（覆盖船检智能体全部固定操作） ====================
+_T = {"taskId": 10001, "clientType": "pc", "sessionType": "operation"}
 DEFAULT_CASES = [
-    {
-        "name": "问题记录",
-        "request": {
-            "taskId": 10001, "clientType": "pc", "pageCode": "inspection",
-            "sessionType": "operation",
-            "content": "发现船体外板存在裂纹，严重程度高，位置在船首左侧外板",
-        },
-        "expect_action": "RECORD_ISSUE",
-    },
-    {
-        "name": "确认整改遗留问题",
-        "request": {
-            "taskId": 10001, "clientType": "pc", "pageCode": "legacy",
-            "sessionType": "operation",
-            "content": "确认这些遗留问题已经整改",
-            "actionParams": {"issueIds": [1001, 1002], "confirmNote": "确认整改完成"},
-        },
-        "expect_action": "CONFIRM_RECTIFICATION_ISSUES",
-    },
-    {
-        "name": "查看检查项概览",
-        "request": {
-            "taskId": 10001, "clientType": "pc", "pageCode": "inspection",
-            "sessionType": "operation",
-            "content": "查看检查项概览",
-        },
-        "expect_action": "VIEW_CHECK_ITEMS_OVERVIEW",
-    },
-    {
-        "name": "开始检验",
-        "request": {
-            "clientType": "pc", "pageCode": "home", "sessionType": "operation",
-            "content": "开始检验",
-        },
-        "expect_action": "START_INSPECTION",
-    },
+    {"name": "开始检验",
+     "request": {"clientType": "pc", "pageCode": "home", "sessionType": "operation",
+                 "content": "开始检验"},
+     "expect_action": "START_INSPECTION"},
+    {"name": "新增检查项",
+     "request": {**_T, "pageCode": "inspection",
+                 "content": "新增检查项：编号A-101，名称救生设备检查"},
+     "expect_action": "ADD_CHECK_ITEM"},
+    {"name": "删除检查项",
+     "request": {**_T, "pageCode": "inspection", "content": "删除检查项A-101"},
+     "expect_action": "DELETE_CHECK_ITEM"},
+    {"name": "保存检查项",
+     "request": {**_T, "pageCode": "inspection", "content": "保存检查项",
+                 "actionParams": {"check_list": [
+                     {"itemCode": "A-101", "itemName": "救生设备检查",
+                      "riskLevel": "low", "itemType": "normal"}]}},
+     "expect_action": "SAVE_CHECK_ITEMS"},
+    {"name": "查看检查项概览",
+     "request": {**_T, "pageCode": "inspection", "content": "查看检查项概览"},
+     "expect_action": "VIEW_CHECK_ITEMS_OVERVIEW"},
+    {"name": "生成开检准备单",
+     "request": {**_T, "pageCode": "inspection", "content": "生成开检准备单"},
+     "expect_action": "GENERATE_PREPARATION_FORM"},
+    {"name": "生成RA报告",
+     "request": {**_T, "pageCode": "inspection", "content": "生成RA报告"},
+     "expect_action": "GENERATE_RA_REPORT"},
+    {"name": "上传资料",
+     "request": {**_T, "pageCode": "inspection", "content": "上传资料"},
+     "expect_action": "OPEN_UPLOAD_MATERIAL"},
+    {"name": "生成工作日志",
+     "request": {**_T, "pageCode": "inspection", "content": "生成工作日志"},
+     "expect_action": "GENERATE_WORK_LOG"},
+    {"name": "问题记录",
+     "request": {**_T, "pageCode": "inspection",
+                 "content": "发现船体外板存在裂纹，严重程度高，位置在船首左侧外板"},
+     "expect_action": "RECORD_ISSUE"},
+    {"name": "确认整改遗留问题",
+     "request": {**_T, "pageCode": "legacy", "content": "确认这些遗留问题已经整改",
+                 "actionParams": {"issueIds": [1001, 1002], "confirmNote": "确认整改完成"}},
+     "expect_action": "CONFIRM_RECTIFICATION_ISSUES"},
+    {"name": "未整改遗留问题",
+     "request": {**_T, "pageCode": "legacy", "content": "这些遗留问题标记为未整改",
+                 "actionParams": {"issueIds": [1001], "remark": "船东未完成整改"}},
+     "expect_action": "PENDING_RECTIFICATION_ISSUES"},
+    {"name": "完成检验任务",
+     "request": {**_T, "pageCode": "inspection", "content": "帮我完成检验任务"},
+     "expect_action": "COMPLETE_INSPECTION_TASK"},
 ]
+
+CONFIG_FILE = "eval_config.json"
+
+
+def load_config() -> dict:
+    if os.path.exists(CONFIG_FILE):
+        with open(CONFIG_FILE, encoding="utf-8") as f:
+            return json.load(f)
+    return {}
 
 
 def now_iso() -> str:
@@ -241,13 +266,16 @@ def evaluate_trace(trace: dict, decl: dict):
 
 
 def main():
+    config = load_config()
     parser = argparse.ArgumentParser()
-    parser.add_argument("--base", default=os.getenv("EVAL_SERVICE_BASE", "http://127.0.0.1:8000"))
-    parser.add_argument("--auth", default=os.getenv("EVAL_SERVICE_AUTH", ""))
-    parser.add_argument("--cases", default="")
+    parser.add_argument("--base", default=os.getenv(
+        "EVAL_SERVICE_BASE", config.get("base", "http://127.0.0.1:8000")))
+    parser.add_argument("--auth", default=os.getenv(
+        "EVAL_SERVICE_AUTH", config.get("auth", "")))
+    parser.add_argument("--cases", default=config.get("cases_file", ""))
     args = parser.parse_args()
 
-    cases = DEFAULT_CASES
+    cases = config.get("cases") or DEFAULT_CASES
     if args.cases:
         with open(args.cases, encoding="utf-8") as f:
             cases = json.load(f)
