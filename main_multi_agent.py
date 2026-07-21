@@ -13,17 +13,21 @@
 前端 static/index.html 零改动；智能体切换与工具执行过程实时显示在思考区。
 """
 
+import asyncio
 import csv
 import json
 import os
+import re
 import uuid
 from datetime import datetime
 from typing import AsyncGenerator, Literal
 
-from fastapi import FastAPI
+import httpx
+from fastapi import FastAPI, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, StreamingResponse
-from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_core.tools import tool
 from langchain_openai import ChatOpenAI
 from langgraph.graph import END, START, MessagesState, StateGraph
@@ -45,6 +49,16 @@ app.add_middleware(
 llm = ChatOpenAI(base_url=BASE_URL, api_key=API_KEY, model=MODEL, streaming=True)
 
 
+@app.exception_handler(RequestValidationError)
+async def validation_error_handler(request: Request, exc: RequestValidationError):
+    body = await request.body()
+    print(
+        f"[422] path={request.url.path} errors={exc.errors()} body={body.decode('utf-8', 'replace')[:2000]}",
+        flush=True,
+    )
+    return JSONResponse(status_code=422, content={"detail": exc.errors()})
+
+
 # ==================== 业务数据：CSV 文件即数据接口（对接时替换为真实数据库/Java 接口） ====================
 
 DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
@@ -64,7 +78,7 @@ def load_ships() -> dict:
         for row in csv.DictReader(f):
             if row["船名"] in ships:
                 ships[row["船名"]]["检验项"].append(
-                    {"编号": row["编号"], "名称": row["名称"], "类别": row["类别"]}
+                    {"编号": row["编号"], "名称": row["名称"], "类别": row["类别"], "风险": row.get("风险") or "低风险"}
                 )
     with open(ISSUES_CSV, encoding="utf-8-sig", newline="") as f:
         for row in csv.DictReader(f):
@@ -83,10 +97,10 @@ def save_ships() -> None:
             w.writerow([name, s["CCSNO"], s["船舶类型"], s["建造日期"], s["检验类型"], s["状态"]])
     with open(ITEMS_CSV, "w", encoding="utf-8-sig", newline="") as f:
         w = csv.writer(f)
-        w.writerow(["船名", "编号", "名称", "类别"])
+        w.writerow(["船名", "编号", "名称", "类别", "风险"])
         for name, s in SHIPS.items():
             for i in s["检验项"]:
-                w.writerow([name, i["编号"], i["名称"], i["类别"]])
+                w.writerow([name, i["编号"], i["名称"], i["类别"], i.get("风险", "低风险")])
     with open(ISSUES_CSV, "w", encoding="utf-8-sig", newline="") as f:
         w = csv.writer(f)
         w.writerow(["船名", "编号", "问题", "状态"])
@@ -118,32 +132,38 @@ def query_ship_info(ship_name: str) -> str:
 
 
 @tool
-def add_inspection_item(ship_name: str, item_name: str, category: str) -> str:
-    """为指定船舶新增一个检验项。category 为类别，如 救生设备/消防设备/外板测厚。"""
+def add_inspection_item(ship_name: str, item_name: str, category: str, item_id: str = "", risk: str = "低风险") -> str:
+    """为指定船舶新增一个检验项。category 为类别，如 救生设备/消防设备/外板测厚；item_id 可选，为检验项编号（如 FC-119），不填则自动编号；risk 可选，为风险等级（高风险/中风险/低风险，默认低风险）。"""
     ship = SHIPS.get(ship_name)
     if not ship:
         return f"未找到船舶「{ship_name}」"
     items = ship["检验项"]
     if any(i["名称"] == item_name for i in items):
         return f"「{item_name}」已在当前检验项中"
-    items.append({"编号": f"NEW-{len(items) + 1}", "名称": item_name, "类别": category})
+    if item_id and any(i["编号"] == item_id for i in items):
+        exist = next(i for i in items if i["编号"] == item_id)
+        return f"新增失败：编号「{item_id}」已被检验项「{exist['名称']}」占用，请更换编号或不指定编号（自动编号）"
+    new_id = item_id or f"NEW-{len(items) + 1}"
+    if risk not in ("高风险", "中风险", "低风险"):
+        risk = "低风险"
+    items.append({"编号": new_id, "名称": item_name, "类别": category, "风险": risk})
     save_ships()
-    return f"已新增检验项「{item_name}」（{category}），已写入 CSV，当前共 {len(items)} 项"
+    return f"已新增检验项 {new_id}「{item_name}」（{category}，{risk}），已写入 CSV，当前共 {len(items)} 项"
 
 
 @tool
 def remove_inspection_item(ship_name: str, item_name: str) -> str:
-    """删除指定船舶的某个检验项（删除痕迹保留）。"""
+    """删除指定船舶的某个检验项，item_name 可以是检验项名称或编号（如 FC-125）。"""
     ship = SHIPS.get(ship_name)
     if not ship:
         return f"未找到船舶「{ship_name}」"
     items = ship["检验项"]
     for i in items:
-        if i["名称"] == item_name:
+        if item_name in (i["名称"], i["编号"]):
             items.remove(i)
             save_ships()
-            return f"已删除检验项「{item_name}」（已写入 CSV），当前共 {len(items)} 项"
-    return f"检验项「{item_name}」不存在"
+            return f"已删除检验项 {i['编号']}「{i['名称']}」（已写入 CSV），当前共 {len(items)} 项"
+    return f"删除失败：检验项「{item_name}」不存在（可用名称或编号删除），请先查询船舶信息确认检验项清单"
 
 
 @tool
@@ -269,7 +289,9 @@ def make_agent_node(name: str):
 
     async def node(state: AgentState):
         messages = [SystemMessage(content=cfg["prompt"])] + state["messages"]
-        response = await agent_llm.ainvoke(messages)
+        response = None
+        async for chunk in agent_llm.astream(messages):
+            response = chunk if response is None else response + chunk
         return {"messages": [response]}
 
     node.__name__ = name
@@ -335,30 +357,26 @@ def sse(obj: dict) -> str:
 
 async def stream_graph(req: ChatRequest) -> AsyncGenerator[str, None]:
     inputs = {"messages": to_lc_messages(req.messages)}
+    current_agent = None
     try:
-        async for event in graph.astream_events(inputs, version="v2"):
-            kind = event["event"]
-            if kind == "on_chain_start" and event.get("name") in AGENTS:
-                desc = AGENTS[event["name"]]["描述"]
-                yield sse({"reasoning": f"\n[调度至 {desc}]\n"})
-            elif kind == "on_chat_model_stream":
-                if event.get("metadata", {}).get("langgraph_node") == "supervisor":
-                    continue
-                chunk = event["data"]["chunk"]
-                reasoning = (chunk.additional_kwargs or {}).get("reasoning_content") or ""
-                if reasoning:
-                    yield sse({"reasoning": reasoning})
-                if chunk.content:
-                    yield sse({"content": chunk.content})
-            elif kind == "on_tool_start":
-                name = event.get("name", "tool")
-                args = event["data"].get("input")
-                yield sse({"reasoning": f"\n[执行工具 {name}，参数 {json.dumps(args, ensure_ascii=False)}]\n"})
-            elif kind == "on_tool_end":
-                name = event.get("name", "tool")
-                output = event["data"].get("output")
-                text = getattr(output, "content", output)
-                yield sse({"reasoning": f"[工具 {name} 返回: {text}]\n"})
+        async for msg, meta in graph.astream(inputs, stream_mode="messages"):
+            node = meta.get("langgraph_node")
+            if node == "supervisor":
+                continue
+            if node in AGENTS and node != current_agent:
+                current_agent = node
+                yield sse({"reasoning": f"\n[调度至 {AGENTS[node]['描述']}]\n"})
+            if isinstance(msg, ToolMessage):
+                yield sse({"reasoning": f"[工具 {msg.name} 返回: {msg.content}]\n"})
+                continue
+            reasoning = (msg.additional_kwargs or {}).get("reasoning_content") or ""
+            if reasoning:
+                yield sse({"reasoning": reasoning})
+            for tc in msg.tool_calls or []:
+                if tc.get("name"):
+                    yield sse({"reasoning": f"\n[执行工具 {tc['name']}，参数 {json.dumps(tc.get('args'), ensure_ascii=False)}]\n"})
+            if msg.content:
+                yield sse({"content": msg.content})
     except Exception as e:
         yield sse({"error": f"执行出错: {e}"})
     yield "data: [DONE]\n\n"
@@ -376,6 +394,2971 @@ async def chat(req: ChatRequest):
 @app.get("/api/agents")
 async def list_agents():
     return {name: cfg["描述"] for name, cfg in AGENTS.items()}
+
+
+# ==================== 船检智能体模型对话流式接口（/api/ai/chat/classify） ====================
+
+TODO_BACKEND_BASE = os.getenv("TODO_BACKEND_BASE_URL", "http://5.5.5.45:8082")
+
+STATUS_CODE_MAP = {
+    "待检验前准备": ("pending_preparation", "待准备"),
+    "待检验": ("pending_inspection", "待检验"),
+    "检验中": ("inspection", "检验中"),
+    "待归档": ("archive", "待归档"),
+}
+
+
+class ClassifyRequest(BaseModel):
+    model_config = {"extra": "ignore"}
+
+    sessionId: int | str | None = None
+    taskId: int | str | None = None
+    clientType: str | None = "pc"
+    pageCode: str | None = "home"
+    sessionType: str | None = "mixed"
+    clientMessageId: str | None = ""
+    content: str = ""
+    actionCode: str | None = ""
+    actionParams: dict | None = None
+    attachmentIds: list[int | str] | None = None
+
+
+def sse_event(event: str, data: dict) -> str:
+    payload = json.dumps(data, ensure_ascii=False)
+    print(f"[SSE] event={event} data={payload}", flush=True)
+    return f"event: {event}\ndata: {payload}\n\n"
+
+
+def local_todo_summary(page: int, limit: int) -> dict:
+    """后端接口不可达时的降级数据源：使用本地船舶任务数据统计待办。"""
+    status_counts: dict = {}
+    todo_list = []
+    task_id = 0
+    for name, s in SHIPS.items():
+        task_id += 1
+        mapped = STATUS_CODE_MAP.get(s["状态"])
+        if not mapped:
+            continue  # 已归档/已完成不计入待办
+        code, code_name = mapped
+        status_counts[code] = status_counts.get(code, 0) + 1
+        todo_list.append(
+            {
+                "taskId": task_id,
+                "taskNo": f"LOCAL-TASK-{task_id:04d}",
+                "shipId": task_id,
+                "shipName": name,
+                "ccsNo": s.get("CCSNO", ""),
+                "inspectionType": "annual" if s.get("检验类型") == "年度检验" else "special",
+                "inspectionTypeName": s.get("检验类型", ""),
+                "status": code,
+                "statusName": code_name,
+                "plannedInspectionDate": "",
+                "surveyorName": "张工",
+                "checkItemCount": len(s.get("检验项", [])),
+                "legacyItemCount": len(s.get("遗留复查项", [])),
+                "issueCount": len(
+                    [x for x in s.get("遗留复查项", []) if x.get("状态") == "未确认"]
+                ),
+                "progressPercent": 0,
+            }
+        )
+    total = len(todo_list)
+    start = (page - 1) * limit
+    return {
+        "todoTotal": total,
+        "statusCounts": status_counts,
+        "todoList": todo_list[start : start + limit],
+        "source": "local_ships",
+    }
+
+
+async def fetch_todo_summary(
+    client_type: str, page: int, limit: int, auth: str
+) -> dict:
+    """优先调用 5.5.5.45:8082 的任务列表/工作台汇总接口，失败时降级为本地数据。"""
+    headers = {"Accept": "application/json"}
+    if auth:
+        headers["Authorization"] = auth
+    async with httpx.AsyncClient(base_url=TODO_BACKEND_BASE, timeout=5) as client:
+        tasks_resp = await client.get(
+            "/api/ai/ship-tasks",
+            params={
+                "clientType": client_type,
+                "page": page,
+                "limit": limit,
+                "todoFilter": "all",
+            },
+            headers=headers,
+        )
+        tasks_resp.raise_for_status()
+        tasks_data = tasks_resp.json().get("data") or {}
+        result = {
+            "todoTotal": tasks_data.get("total"),
+            "statusCounts": {},
+            "todoList": tasks_data.get("list") or [],
+            "source": "ship_tasks",
+        }
+        try:
+            summary_resp = await client.get(
+                "/api/ai/workbench/summary",
+                params={"clientType": client_type},
+                headers=headers,
+            )
+            summary_resp.raise_for_status()
+            summary_data = summary_resp.json().get("data") or {}
+            result["statusCounts"] = summary_data.get("statusCounts") or {}
+            if result["todoTotal"] is None:
+                result["todoTotal"] = summary_data.get("todoTotal")
+                result["source"] = "workbench_summary"
+        except Exception as e:
+            print(f"[todo] 工作台汇总接口不可用: {e}", flush=True)
+        return result
+
+
+async def stream_classify(req: ClassifyRequest, auth: str) -> AsyncGenerator[str, None]:
+    request_id = str(uuid.uuid4())
+    session_id = req.sessionId or int(datetime.now().timestamp() * 1000)
+    if isinstance(session_id, str) and session_id.isdigit():
+        session_id = int(session_id)
+    turn_id = int(datetime.now().timestamp() * 1000) + 1
+    user_message_id = turn_id + 1
+    seq = 0
+
+    yield sse_event(
+        "message_start",
+        {
+            "requestId": request_id,
+            "sessionId": session_id,
+            "turnId": turn_id,
+            "userMessageId": user_message_id,
+            "assistantMessageId": None,
+            "status": "running",
+        },
+    )
+
+    params = req.actionParams or {}
+    page = int(params.get("todoPage") or 1)
+    limit = int(params.get("todoLimit") or 20)
+    try:
+        todo = await fetch_todo_summary(req.clientType or "pc", page, limit, auth)
+    except Exception as e:
+        print(f"[todo] 后端待办接口不可达（{TODO_BACKEND_BASE}），降级为本地数据: {e}", flush=True)
+        try:
+            todo = local_todo_summary(page, limit)
+        except Exception as e2:
+            print(f"[todo] 本地待办统计失败: {e2}", flush=True)
+            todo = None
+
+    seq += 1
+    if todo is None:
+        yield sse_event(
+            "answer_delta",
+            {
+                "seq": seq,
+                "type": "todo_summary",
+                "actionCode": "QUERY_MY_TODOS",
+                "actionName": "查询我的待办",
+                "content": "暂时无法获取待办统计，我继续为你处理问题。",
+                "todoTotal": None,
+                "todoPage": page,
+                "todoLimit": limit,
+                "statusCounts": {},
+                "todoList": [],
+                "source": "",
+            },
+        )
+    else:
+        total = todo["todoTotal"]
+        shown = len(todo["todoList"])
+        content = (
+            f"根据当前任务统计，你当前共有 {total} 项待办任务"
+            + (f"，下面是优先展示的 {shown} 条待办。" if shown else "。")
+            if total is not None
+            else "暂时无法获取待办统计，我继续为你处理问题。"
+        )
+        yield sse_event(
+            "answer_delta",
+            {
+                "seq": seq,
+                "type": "todo_summary",
+                "actionCode": "QUERY_MY_TODOS",
+                "actionName": "查询我的待办",
+                "content": content,
+                "todoTotal": total,
+                "todoPage": page,
+                "todoLimit": limit,
+                "statusCounts": todo["statusCounts"],
+                "todoList": todo["todoList"],
+                "source": todo["source"],
+            },
+        )
+
+    if req.actionCode:
+        yield sse_event(
+            "action_intent",
+            {"actionCode": req.actionCode, "actionName": "查询我的待办" if req.actionCode == "QUERY_MY_TODOS" else req.actionCode},
+        )
+        if req.actionCode == "QUERY_MY_TODOS" and todo is not None:
+            yield sse_event(
+                "action_result",
+                {
+                    "actionCode": "QUERY_MY_TODOS",
+                    "status": "success",
+                    "message": "查询成功",
+                    "payload": {
+                        "todoTotal": todo["todoTotal"],
+                        "todoList": todo["todoList"],
+                    },
+                },
+            )
+
+    status = "success"
+    try:
+        inputs = {"messages": [HumanMessage(content=req.content or "查询我的待办任务")]}
+        async for msg, meta in graph.astream(inputs, stream_mode="messages"):
+            node = meta.get("langgraph_node")
+            if node == "supervisor" or isinstance(msg, ToolMessage):
+                continue
+            if msg.content:
+                seq += 1
+                yield sse_event(
+                    "answer_delta",
+                    {"seq": seq, "type": "model_delta", "content": msg.content},
+                )
+    except Exception as e:
+        status = "error"
+        yield sse_event("error", {"requestId": request_id, "message": f"模型调用失败: {e}"})
+
+    if status == "success":
+        yield sse_event(
+            "message_end",
+            {
+                "requestId": request_id,
+                "sessionId": session_id,
+                "turnId": turn_id,
+                "userMessageId": user_message_id,
+                "assistantMessageId": user_message_id + 1,
+                "status": "success",
+                "actionCode": req.actionCode or "GENERAL_QA",
+            },
+        )
+
+
+# ==================== 新增检验项（ADD_CHECK_ITEM） ====================
+
+RISK_LEVEL_NAMES = {"high": "高风险", "medium": "中风险", "low": "低风险"}
+RISK_WORD_MAP = {"高": "high", "中": "medium", "低": "low"}
+ADD_CHECK_ITEM_PATTERN = re.compile(r"新增检[验查]项")
+
+LOCAL_CHECK_ITEMS: dict = {}
+LOCAL_ITEM_ID_SEQ = {"value": 90000}
+
+
+def detect_add_check_item(req: ClassifyRequest) -> bool:
+    if req.actionCode == "ADD_CHECK_ITEM":
+        return True
+    return bool(req.content and ADD_CHECK_ITEM_PATTERN.search(req.content))
+
+
+def parse_check_item_params(content: str, params: dict | None) -> dict:
+    out = {k: v for k, v in (params or {}).items() if v not in (None, "")}
+    text = content or ""
+    if not out.get("itemName"):
+        m = re.search(r"新增检[验查]项[：:，,\s]*([^，,。;；\s]+)", text)
+        if m:
+            out["itemName"] = m.group(1)
+    if not out.get("itemCode"):
+        m = re.search(r"编号[：:\s]*([A-Za-z][A-Za-z0-9\-_]*)", text) or re.search(
+            r"\b([A-Z]{2,}-\d+)\b", text
+        )
+        if m:
+            out["itemCode"] = m.group(1)
+    if not out.get("disciplineName"):
+        m = re.search(r"专业[：:\s]*([^，,。;；\s]+)", text)
+        if m:
+            out["disciplineName"] = m.group(1)
+    if not out.get("sectionName"):
+        m = re.search(r"分组[：:\s]*([^，,。;；\s]+)", text)
+        if m:
+            out["sectionName"] = m.group(1)
+    if not out.get("riskLevel"):
+        m = re.search(r"风险等级[：:\s]*(高|中|低|high|medium|low)", text)
+        if m:
+            out["riskLevel"] = RISK_WORD_MAP.get(m.group(1), m.group(1))
+    return out
+
+
+def count_check_items(tree: list) -> int:
+    total = 0
+    for discipline in tree or []:
+        count = discipline.get("count")
+        if count is not None:
+            total += int(count)
+        else:
+            for section in discipline.get("sections") or []:
+                total += len(section.get("items") or [])
+    return total
+
+
+def backend_headers(auth: str) -> dict:
+    headers = {"Accept": "application/json"}
+    if auth:
+        headers["Authorization"] = auth
+    return headers
+
+
+async def add_check_item_backend(task_id, body: dict, auth: str) -> dict:
+    async with httpx.AsyncClient(base_url=TODO_BACKEND_BASE, timeout=10) as client:
+        resp = await client.post(
+            f"/api/ai/ship-tasks/{task_id}/check-items",
+            json=body,
+            headers=backend_headers(auth),
+        )
+        resp.raise_for_status()
+        return (resp.json() or {}).get("data") or {}
+
+
+async def fetch_check_item_tree(task_id, auth: str) -> list:
+    async with httpx.AsyncClient(base_url=TODO_BACKEND_BASE, timeout=10) as client:
+        resp = await client.get(
+            f"/api/ai/ship-tasks/{task_id}/check-items",
+            params={"includeDeleted": "false"},
+            headers=backend_headers(auth),
+        )
+        resp.raise_for_status()
+        data = (resp.json() or {}).get("data")
+        return data or []
+
+
+def local_add_check_item(task_id, body: dict) -> dict:
+    """后端不可达时的降级：在本地内存中维护该任务的检查项。"""
+    LOCAL_ITEM_ID_SEQ["value"] += 1
+    item = {
+        "itemId": LOCAL_ITEM_ID_SEQ["value"],
+        "itemCode": body.get("itemCode", ""),
+        "itemName": body.get("itemName", ""),
+        "disciplineCode": body.get("disciplineCode", ""),
+        "disciplineName": body.get("disciplineName", "") or "未分类",
+        "sectionName": body.get("sectionName", "") or "默认分组",
+        "riskLevel": body.get("riskLevel", ""),
+        "riskLevelName": RISK_LEVEL_NAMES.get(body.get("riskLevel", ""), ""),
+        "status": "pending",
+        "regulationBasis": body.get("regulationBasis"),
+        "actionRequirement": body.get("actionRequirement"),
+    }
+    LOCAL_CHECK_ITEMS.setdefault(str(task_id), []).append(item)
+    return item
+
+
+def local_check_item_tree(task_id) -> list:
+    disciplines: dict = {}
+    for item in LOCAL_CHECK_ITEMS.get(str(task_id), []):
+        d_key = (item.get("disciplineCode") or "", item.get("disciplineName") or "未分类")
+        discipline = disciplines.setdefault(
+            d_key,
+            {
+                "disciplineCode": d_key[0],
+                "disciplineName": d_key[1],
+                "count": 0,
+                "sections": {},
+            },
+        )
+        discipline["count"] += 1
+        section = discipline["sections"].setdefault(
+            item.get("sectionName") or "默认分组",
+            {"sectionName": item.get("sectionName") or "默认分组", "items": []},
+        )
+        section["items"].append(
+            {
+                "itemId": item["itemId"],
+                "itemCode": item["itemCode"],
+                "itemName": item["itemName"],
+                "riskLevel": item["riskLevel"],
+                "riskLevelName": item["riskLevelName"],
+                "status": item["status"],
+                "regulationBasis": item.get("regulationBasis"),
+                "actionRequirement": item.get("actionRequirement"),
+            }
+        )
+    return [
+        {**d, "sections": list(d["sections"].values())} for d in disciplines.values()
+    ]
+
+
+async def stream_add_check_item(
+    req: ClassifyRequest, auth: str
+) -> AsyncGenerator[str, None]:
+    request_id = str(uuid.uuid4())
+    session_id = req.sessionId or int(datetime.now().timestamp() * 1000)
+    if isinstance(session_id, str) and session_id.isdigit():
+        session_id = int(session_id)
+    turn_id = int(datetime.now().timestamp() * 1000) + 1
+    user_message_id = turn_id + 1
+    seq = 0
+
+    yield sse_event(
+        "message_start",
+        {
+            "requestId": request_id,
+            "sessionId": session_id,
+            "turnId": turn_id,
+            "userMessageId": user_message_id,
+            "assistantMessageId": None,
+            "status": "running",
+        },
+    )
+
+    task_id = req.taskId
+    if isinstance(task_id, str) and task_id.isdigit():
+        task_id = int(task_id)
+    params = parse_check_item_params(req.content or "", req.actionParams)
+
+    def base_delta(status: str, content: str) -> dict:
+        return {
+            "seq": 1,
+            "type": "action_result",
+            "actionCode": "ADD_CHECK_ITEM",
+            "actionName": "新增检查项",
+            "status": status,
+            "content": content,
+            "taskId": task_id,
+            "addedItem": None,
+            "checkItemTotal": None,
+            "checkItemTree": [],
+        }
+
+    rejected = None
+    if task_id in (None, ""):
+        rejected = base_delta("rejected", "新增失败：该操作需要关联检验任务。")
+    elif not params.get("itemCode") or not params.get("itemName"):
+        rejected = base_delta("rejected", "新增失败：缺少检验项编号或检验项名称。")
+
+    if rejected is not None:
+        seq = 1
+        yield sse_event("answer_delta", rejected)
+        yield sse_event(
+            "message_end",
+            {
+                "requestId": request_id,
+                "sessionId": session_id,
+                "turnId": turn_id,
+                "userMessageId": user_message_id,
+                "assistantMessageId": user_message_id + 1,
+                "status": "success",
+                "actionCode": "ADD_CHECK_ITEM",
+            },
+        )
+        return
+
+    body = {
+        "itemCode": params.get("itemCode", ""),
+        "itemName": params.get("itemName", ""),
+        "disciplineCode": params.get("disciplineCode", ""),
+        "disciplineName": params.get("disciplineName", ""),
+        "sectionName": params.get("sectionName", ""),
+        "riskLevel": params.get("riskLevel", ""),
+        "source": "ai",
+    }
+    for key in ("categoryName", "regulationBasis", "actionRequirement"):
+        if params.get(key):
+            body[key] = params[key]
+
+    added_item = None
+    tree_source = "check_items_after_add"
+    try:
+        added_item = await add_check_item_backend(task_id, body, auth)
+    except Exception as e:
+        print(
+            f"[check-item] 后端新增接口不可达（{TODO_BACKEND_BASE}），降级为本地数据: {e}",
+            flush=True,
+        )
+        added_item = local_add_check_item(task_id, body)
+        tree_source = "local_check_items"
+
+    if not added_item or not added_item.get("itemId"):
+        added_item = {
+            **(added_item or {}),
+            "itemCode": body["itemCode"],
+            "itemName": body["itemName"],
+            "disciplineCode": body["disciplineCode"],
+            "disciplineName": body["disciplineName"],
+            "sectionName": body["sectionName"],
+            "riskLevel": body["riskLevel"],
+            "riskLevelName": RISK_LEVEL_NAMES.get(body["riskLevel"], ""),
+            "status": "pending",
+        }
+
+    tree = None
+    if tree_source == "local_check_items":
+        tree = local_check_item_tree(task_id)
+    else:
+        try:
+            tree = await fetch_check_item_tree(task_id, auth)
+        except Exception as e:
+            print(f"[check-item] 检查项树查询失败: {e}", flush=True)
+
+    seq = 1
+    if tree is None:
+        delta = base_delta(
+            "partial_success", "新增成功，但暂时无法获取最新检查项列表。"
+        )
+        delta["addedItem"] = added_item
+        yield sse_event("answer_delta", delta)
+    else:
+        total = count_check_items(tree)
+        delta = base_delta("success", f"新增成功，现有 {total} 条检查项。")
+        delta.update(
+            {
+                "addedItem": added_item,
+                "checkItemTotal": total,
+                "checkItemTree": tree,
+                "refresh": ["checkItems", "overview"],
+                "source": tree_source,
+            }
+        )
+        yield sse_event("answer_delta", delta)
+        yield sse_event(
+            "action_result",
+            {
+                "actionCode": "ADD_CHECK_ITEM",
+                "status": "success",
+                "message": "新增成功",
+                "payload": {
+                    "taskId": task_id,
+                    "addedItem": added_item,
+                    "checkItemTotal": total,
+                },
+            },
+        )
+
+    yield sse_event(
+        "message_end",
+        {
+            "requestId": request_id,
+            "sessionId": session_id,
+            "turnId": turn_id,
+            "userMessageId": user_message_id,
+            "assistantMessageId": user_message_id + 1,
+            "status": "success",
+            "actionCode": "ADD_CHECK_ITEM",
+        },
+    )
+
+
+# ==================== 删除检查项（DELETE_CHECK_ITEM） ====================
+
+DELETE_CHECK_ITEM_PATTERN = re.compile(
+    r"(删除|移除|去掉).{0,40}检[验查]|检[验查]项.{0,20}(删除|移除|去掉)"
+)
+
+
+def detect_delete_check_item(req: ClassifyRequest) -> bool:
+    if req.actionCode == "DELETE_CHECK_ITEM":
+        return True
+    if req.actionCode:
+        return False
+    return bool(req.content and DELETE_CHECK_ITEM_PATTERN.search(req.content))
+
+
+def flatten_check_item_tree(tree: list) -> list:
+    flat = []
+    for discipline in tree or []:
+        for section in discipline.get("sections") or []:
+            for item in section.get("items") or []:
+                flat.append(
+                    {
+                        **item,
+                        "disciplineCode": discipline.get("disciplineCode"),
+                        "disciplineName": discipline.get("disciplineName"),
+                        "sectionName": section.get("sectionName"),
+                    }
+                )
+    return flat
+
+
+def parse_delete_target(content: str, params: dict | None) -> dict:
+    out = {k: v for k, v in (params or {}).items() if v not in (None, "")}
+    text = content or ""
+    if not out.get("itemCode"):
+        m = re.search(r"编号[：:\s]*([A-Za-z][A-Za-z0-9\-_]*)", text) or re.search(
+            r"\b([A-Z]{2,}-\d+)\b", text
+        )
+        if m:
+            out["itemCode"] = m.group(1)
+    if not out.get("targetText") and not out.get("itemName") and not out.get("itemId"):
+        m = (
+            re.search(r"(?:删除|移除|去掉)[：:，,\s]*(.+?)(?:这个|这条|这一项)?检[验查]项", text)
+            or re.search(r"(?:删除|移除|去掉)检[验查]项[：:，,\s]*([^，,。;；\s]+)", text)
+            or re.search(r"把(.+?)(?:这个|这条|这一项)?检[验查]项?(?:从.*)?(?:删除|移除|去掉)", text)
+        )
+        if m:
+            target = m.group(1).strip("，, 　")
+            if target:
+                out["targetText"] = target
+    return out
+
+
+def match_check_items(flat: list, target: dict) -> list:
+    item_id = target.get("itemId")
+    if item_id not in (None, ""):
+        matched = [i for i in flat if str(i.get("itemId")) == str(item_id)]
+        if matched:
+            return matched
+
+    item_code = target.get("itemCode") or ""
+    if item_code:
+        exact = [i for i in flat if (i.get("itemCode") or "") == item_code]
+        if exact:
+            return exact
+        partial = [i for i in flat if item_code in (i.get("itemCode") or "")]
+        if partial:
+            return partial
+
+    item_name = target.get("itemName") or ""
+    if item_name:
+        exact = [i for i in flat if (i.get("itemName") or "") == item_name]
+        if exact:
+            return exact
+        partial = [i for i in flat if item_name in (i.get("itemName") or "")]
+        if partial:
+            return partial
+
+    text = target.get("targetText") or ""
+    if text:
+        exact = [
+            i
+            for i in flat
+            if text in ((i.get("itemName") or ""), (i.get("itemCode") or ""))
+        ]
+        if exact:
+            return exact
+        partial = [
+            i
+            for i in flat
+            if text in (i.get("itemName") or "")
+            or text in (i.get("itemCode") or "")
+            or text in (i.get("sectionName") or "")
+            or text in (i.get("disciplineName") or "")
+        ]
+        if partial:
+            return partial
+
+    candidates = flat
+    has_filter = False
+    for key, field in (
+        ("disciplineName", "disciplineName"),
+        ("sectionName", "sectionName"),
+        ("riskLevel", "riskLevel"),
+    ):
+        value = target.get(key)
+        if value:
+            has_filter = True
+            candidates = [c for c in candidates if (c.get(field) or "") == value]
+    if has_filter:
+        return candidates
+    return []
+
+
+async def delete_check_item_backend(task_id, item_id, reason: str, auth: str) -> None:
+    async with httpx.AsyncClient(base_url=TODO_BACKEND_BASE, timeout=10) as client:
+        resp = await client.delete(
+            f"/api/ai/ship-tasks/{task_id}/check-items/{item_id}",
+            params={"source": "ai", "reason": reason},
+            headers=backend_headers(auth),
+        )
+        resp.raise_for_status()
+
+
+def local_delete_check_item(task_id, item_id) -> bool:
+    items = LOCAL_CHECK_ITEMS.get(str(task_id), [])
+    for idx, item in enumerate(items):
+        if str(item.get("itemId")) == str(item_id):
+            items.pop(idx)
+            return True
+    return False
+
+
+async def stream_delete_check_item(
+    req: ClassifyRequest, auth: str
+) -> AsyncGenerator[str, None]:
+    request_id = str(uuid.uuid4())
+    session_id = req.sessionId or int(datetime.now().timestamp() * 1000)
+    if isinstance(session_id, str) and session_id.isdigit():
+        session_id = int(session_id)
+    turn_id = int(datetime.now().timestamp() * 1000) + 1
+    user_message_id = turn_id + 1
+
+    yield sse_event(
+        "message_start",
+        {
+            "requestId": request_id,
+            "sessionId": session_id,
+            "turnId": turn_id,
+            "userMessageId": user_message_id,
+            "assistantMessageId": None,
+            "status": "running",
+        },
+    )
+
+    task_id = req.taskId
+    if isinstance(task_id, str) and task_id.isdigit():
+        task_id = int(task_id)
+    target = parse_delete_target(req.content or "", req.actionParams)
+
+    def base_delta(status: str, content: str) -> dict:
+        return {
+            "seq": 1,
+            "type": "action_result",
+            "actionCode": "DELETE_CHECK_ITEM",
+            "actionName": "删除检查项",
+            "status": status,
+            "content": content,
+            "taskId": task_id,
+            "deletedItem": None,
+            "checkItemTotal": None,
+            "check_list": [],
+        }
+
+    async def finish(delta: dict, extra_action_result: dict | None = None):
+        yield sse_event("answer_delta", delta)
+        if extra_action_result is not None:
+            yield sse_event("action_result", extra_action_result)
+        yield sse_event(
+            "message_end",
+            {
+                "requestId": request_id,
+                "sessionId": session_id,
+                "turnId": turn_id,
+                "userMessageId": user_message_id,
+                "assistantMessageId": user_message_id + 1,
+                "status": "success",
+                "actionCode": "DELETE_CHECK_ITEM",
+            },
+        )
+
+    if task_id in (None, ""):
+        async for chunk in finish(
+            base_delta("rejected", "删除失败：该操作需要关联检验任务。")
+        ):
+            yield chunk
+        return
+
+    tree_source = "check_items_after_delete"
+    use_local = False
+    try:
+        tree = await fetch_check_item_tree(task_id, auth)
+    except Exception as e:
+        print(
+            f"[check-item] 后端检查项树接口不可达（{TODO_BACKEND_BASE}），降级为本地数据: {e}",
+            flush=True,
+        )
+        use_local = True
+        tree_source = "local_check_items"
+        tree = local_check_item_tree(task_id)
+
+    flat = flatten_check_item_tree(tree)
+    total = count_check_items(tree)
+
+    def delta_with_tree(status: str, content: str) -> dict:
+        delta = base_delta(status, content)
+        delta["checkItemTotal"] = total
+        delta["check_list"] = tree
+        delta["checkItemTree"] = tree
+        return delta
+
+    has_target = any(
+        target.get(k)
+        for k in (
+            "itemId",
+            "itemCode",
+            "itemName",
+            "targetText",
+            "disciplineName",
+            "sectionName",
+            "riskLevel",
+        )
+    )
+    if not has_target:
+        async for chunk in finish(
+            delta_with_tree("rejected", "删除失败：请提供要删除的检查项名称或编号。")
+        ):
+            yield chunk
+        return
+
+    matched = match_check_items(flat, target)
+    if not matched:
+        async for chunk in finish(
+            delta_with_tree("rejected", "删除失败：未找到匹配的检查项。")
+        ):
+            yield chunk
+        return
+    if len(matched) > 1:
+        delta = delta_with_tree(
+            "rejected", "删除失败：匹配到多个检查项，请补充检查项编号或完整名称。"
+        )
+        delta["candidates"] = [
+            {
+                "itemId": i.get("itemId"),
+                "itemCode": i.get("itemCode"),
+                "itemName": i.get("itemName"),
+            }
+            for i in matched
+        ]
+        async for chunk in finish(delta):
+            yield chunk
+        return
+
+    item = matched[0]
+    reason = target.get("reason") or (req.content or "AI 根据用户要求删除检查项")[:200]
+    if use_local:
+        deleted = local_delete_check_item(task_id, item.get("itemId"))
+    else:
+        try:
+            await delete_check_item_backend(task_id, item.get("itemId"), reason, auth)
+            deleted = True
+        except Exception as e:
+            print(f"[check-item] 删除接口调用失败: {e}", flush=True)
+            deleted = False
+    if not deleted:
+        async for chunk in finish(
+            delta_with_tree("failed", "删除失败：删除检查项接口调用失败，请稍后重试。")
+        ):
+            yield chunk
+        return
+
+    if use_local:
+        tree = local_check_item_tree(task_id)
+    else:
+        try:
+            tree = await fetch_check_item_tree(task_id, auth)
+        except Exception as e:
+            print(f"[check-item] 删除后检查项树查询失败: {e}", flush=True)
+            tree = []
+    total = count_check_items(tree)
+
+    deleted_item = {
+        "itemId": item.get("itemId"),
+        "itemCode": item.get("itemCode"),
+        "itemName": item.get("itemName"),
+        "disciplineName": item.get("disciplineName"),
+        "sectionName": item.get("sectionName"),
+        "riskLevel": item.get("riskLevel"),
+        "riskLevelName": item.get("riskLevelName")
+        or RISK_LEVEL_NAMES.get(item.get("riskLevel") or "", ""),
+    }
+    delta = base_delta("success", f"删除成功，现有 {total} 条检查项。")
+    delta.update(
+        {
+            "deletedItem": deleted_item,
+            "checkItemTotal": total,
+            "check_list": tree,
+            "checkItemTree": tree,
+            "refresh": ["checkItems", "overview"],
+            "source": tree_source,
+        }
+    )
+    async for chunk in finish(
+        delta,
+        {
+            "actionCode": "DELETE_CHECK_ITEM",
+            "status": "success",
+            "message": "删除成功",
+            "payload": {
+                "taskId": task_id,
+                "deletedItem": deleted_item,
+                "checkItemTotal": total,
+            },
+        },
+    ):
+        yield chunk
+
+
+# ==================== 保存检查项（SAVE_CHECK_ITEMS） ====================
+
+SAVE_CHECK_ITEMS_PATTERN = re.compile(
+    r"(保存|落库).{0,30}(检[验查]项|清单)|(检[验查]项|清单).{0,20}(保存|落库)"
+)
+
+
+def detect_save_check_items(req: ClassifyRequest) -> bool:
+    if req.actionCode == "SAVE_CHECK_ITEMS":
+        return True
+    if req.actionCode:
+        return False
+    text = req.content or ""
+    if not SAVE_CHECK_ITEMS_PATTERN.search(text):
+        return False
+    if re.search(r"如何|怎么|怎样|能不能|可以.*吗|？|\?", text):
+        return False
+    return True
+
+
+def normalize_check_list(raw) -> list:
+    """把 check_list（扁平列表或检查项树）归一化为扁平检查项列表。"""
+    flat = []
+    for entry in raw or []:
+        if not isinstance(entry, dict):
+            continue
+        if "sections" in entry:
+            for section in entry.get("sections") or []:
+                for item in section.get("items") or []:
+                    if isinstance(item, dict):
+                        flat.append(
+                            {
+                                **item,
+                                "disciplineCode": item.get("disciplineCode")
+                                or entry.get("disciplineCode"),
+                                "disciplineName": item.get("disciplineName")
+                                or entry.get("disciplineName"),
+                                "sectionName": item.get("sectionName")
+                                or section.get("sectionName"),
+                            }
+                        )
+        else:
+            flat.append(entry)
+    return flat
+
+
+def build_save_item_body(item: dict) -> dict:
+    body = {
+        "itemCode": item.get("itemCode") or "",
+        "itemName": item.get("itemName") or "",
+        "riskLevel": item.get("riskLevel") or "low",
+        "itemType": item.get("itemType") or "normal",
+        "source": "ai",
+    }
+    for key in (
+        "disciplineCode",
+        "disciplineName",
+        "sectionName",
+        "categoryName",
+        "regulationBasis",
+        "actionRequirement",
+    ):
+        if item.get(key):
+            body[key] = item[key]
+    return body
+
+
+async def stream_save_check_items(
+    req: ClassifyRequest, auth: str
+) -> AsyncGenerator[str, None]:
+    request_id = str(uuid.uuid4())
+    session_id = req.sessionId or int(datetime.now().timestamp() * 1000)
+    if isinstance(session_id, str) and session_id.isdigit():
+        session_id = int(session_id)
+    turn_id = int(datetime.now().timestamp() * 1000) + 1
+    user_message_id = turn_id + 1
+
+    yield sse_event(
+        "message_start",
+        {
+            "requestId": request_id,
+            "sessionId": session_id,
+            "turnId": turn_id,
+            "userMessageId": user_message_id,
+            "assistantMessageId": None,
+            "status": "running",
+        },
+    )
+
+    task_id = req.taskId
+    if isinstance(task_id, str) and task_id.isdigit():
+        task_id = int(task_id)
+    params = req.actionParams or {}
+    raw_list = params.get("check_list")
+    if raw_list is None:
+        raw_list = params.get("check_lsit")  # 兼容上游误传字段名
+
+    def base_delta(status: str, content: str) -> dict:
+        return {
+            "seq": 1,
+            "type": "action_result",
+            "actionCode": "SAVE_CHECK_ITEMS",
+            "actionName": "保存检查项",
+            "status": status,
+            "content": content,
+            "taskId": task_id,
+            "saveTotal": 0,
+            "successTotal": 0,
+            "failedTotal": 0,
+            "savedItems": [],
+            "failedItems": [],
+        }
+
+    async def finish(delta: dict, extra_action_result: dict | None = None):
+        yield sse_event("answer_delta", delta)
+        if extra_action_result is not None:
+            yield sse_event("action_result", extra_action_result)
+        yield sse_event(
+            "message_end",
+            {
+                "requestId": request_id,
+                "sessionId": session_id,
+                "turnId": turn_id,
+                "userMessageId": user_message_id,
+                "assistantMessageId": user_message_id + 1,
+                "status": "success",
+                "actionCode": "SAVE_CHECK_ITEMS",
+            },
+        )
+
+    if task_id in (None, ""):
+        delta = base_delta("rejected", "保存失败：该操作需要关联检验任务。")
+        async for chunk in finish(delta):
+            yield chunk
+        return
+    if raw_list is None:
+        delta = base_delta("rejected", "保存失败：缺少 check_list，无法保存检查项。")
+        async for chunk in finish(delta):
+            yield chunk
+        return
+
+    items = normalize_check_list(raw_list)
+    if not items:
+        delta = base_delta(
+            "rejected", "保存失败：check_list 为空，没有需要保存的检查项。"
+        )
+        async for chunk in finish(delta):
+            yield chunk
+        return
+
+    saved_items = []
+    failed_items = []
+    backend_available = True
+    for item in items:
+        body = build_save_item_body(item)
+        if not body["itemCode"]:
+            failed_items.append(
+                {
+                    "itemCode": body["itemCode"],
+                    "itemName": body["itemName"],
+                    "reason": "itemCode 不能为空",
+                }
+            )
+            continue
+        if not body["itemName"]:
+            failed_items.append(
+                {
+                    "itemCode": body["itemCode"],
+                    "itemName": body["itemName"],
+                    "reason": "itemName 不能为空",
+                }
+            )
+            continue
+        added = None
+        if backend_available:
+            try:
+                added = await add_check_item_backend(task_id, body, auth)
+            except (httpx.ConnectError, httpx.ConnectTimeout) as e:
+                print(
+                    f"[check-item] 后端新增接口不可达（{TODO_BACKEND_BASE}），降级为本地数据: {e}",
+                    flush=True,
+                )
+                backend_available = False
+            except Exception as e:
+                failed_items.append(
+                    {
+                        "itemCode": body["itemCode"],
+                        "itemName": body["itemName"],
+                        "reason": f"新增接口调用失败: {e}",
+                    }
+                )
+                continue
+        if not backend_available:
+            added = local_add_check_item(task_id, body)
+        saved_items.append(
+            {
+                "itemId": (added or {}).get("itemId"),
+                "itemCode": body["itemCode"],
+                "itemName": body["itemName"],
+            }
+        )
+
+    save_total = len(items)
+    success_total = len(saved_items)
+    failed_total = len(failed_items)
+    if success_total == 0:
+        status = "failed"
+        content = f"保存失败：{save_total} 条检查项均未保存成功。"
+    elif failed_total > 0:
+        status = "partial_success"
+        content = f"保存完成，成功新增 {success_total} 条，失败 {failed_total} 条。"
+    else:
+        status = "success"
+        content = f"保存成功，已新增 {success_total} 条检查项。"
+
+    delta = base_delta(status, content)
+    delta.update(
+        {
+            "saveTotal": save_total,
+            "successTotal": success_total,
+            "failedTotal": failed_total,
+            "savedItems": saved_items,
+            "failedItems": failed_items,
+            "refresh": ["checkItems", "overview"],
+            "source": "check_items_after_save"
+            if backend_available
+            else "local_check_items",
+        }
+    )
+    extra = None
+    if success_total > 0:
+        extra = {
+            "actionCode": "SAVE_CHECK_ITEMS",
+            "status": status,
+            "message": content,
+            "payload": {
+                "taskId": task_id,
+                "saveTotal": save_total,
+                "successTotal": success_total,
+                "failedTotal": failed_total,
+                "savedItems": saved_items,
+                "failedItems": failed_items,
+            },
+        }
+    async for chunk in finish(delta, extra):
+        yield chunk
+
+
+# ==================== 生成检验单（GENERATE_PREPARATION_FORM） ====================
+
+GENERATE_FORM_PATTERN = re.compile(
+    r"生成.{0,20}(检验单|准备单|准备文档)|(检验单|准备单|准备文档).{0,10}生成|(检[验查]内容|检[验查]项).{0,10}生成一?份?(检验单|准备单)"
+)
+GENERATE_FORM_EXCLUDE_PATTERN = re.compile(
+    r"如何|怎么|怎样|需要哪些|哪些步骤|是什么|什么是|能不能|可以.*吗|？|\?|查看|已经生成|推送"
+)
+
+LOCAL_PREPARATION_DOC_SEQ = {"value": 80000}
+
+
+def detect_generate_preparation_form(req: ClassifyRequest) -> bool:
+    if req.actionCode == "GENERATE_PREPARATION_FORM":
+        return True
+    if req.actionCode:
+        return False
+    text = req.content or ""
+    if not GENERATE_FORM_PATTERN.search(text):
+        return False
+    if GENERATE_FORM_EXCLUDE_PATTERN.search(text):
+        return False
+    return True
+
+
+async def generate_preparation_form_backend(task_id, auth: str) -> dict:
+    async with httpx.AsyncClient(base_url=TODO_BACKEND_BASE, timeout=30) as client:
+        resp = await client.post(
+            f"/api/ai/ship-tasks/{task_id}/preparation/generate",
+            headers=backend_headers(auth),
+        )
+        resp.raise_for_status()
+        return (resp.json() or {}).get("data") or {}
+
+
+def local_generate_preparation_form(task_id) -> dict:
+    LOCAL_PREPARATION_DOC_SEQ["value"] += 1
+    return {
+        "docId": LOCAL_PREPARATION_DOC_SEQ["value"],
+        "docNo": f"PREP-{task_id}-{datetime.now().strftime('%Y%m%d')}",
+        "versionNo": 1,
+        "status": "generated",
+        "viewType": "surveyor",
+    }
+
+
+async def stream_generate_preparation_form(
+    req: ClassifyRequest, auth: str
+) -> AsyncGenerator[str, None]:
+    request_id = str(uuid.uuid4())
+    session_id = req.sessionId or int(datetime.now().timestamp() * 1000)
+    if isinstance(session_id, str) and session_id.isdigit():
+        session_id = int(session_id)
+    turn_id = int(datetime.now().timestamp() * 1000) + 1
+    user_message_id = turn_id + 1
+
+    yield sse_event(
+        "message_start",
+        {
+            "requestId": request_id,
+            "sessionId": session_id,
+            "turnId": turn_id,
+            "userMessageId": user_message_id,
+            "assistantMessageId": None,
+            "status": "running",
+        },
+    )
+
+    task_id = req.taskId
+    if isinstance(task_id, str) and task_id.isdigit():
+        task_id = int(task_id)
+
+    def base_delta(status: str, content: str) -> dict:
+        return {
+            "seq": 1,
+            "type": "action_result",
+            "actionCode": "GENERATE_PREPARATION_FORM",
+            "actionName": "生成检验单",
+            "status": status,
+            "content": content,
+            "taskId": task_id,
+            "preparationForm": None,
+        }
+
+    async def finish(delta: dict, extra_action_result: dict | None = None):
+        yield sse_event("answer_delta", delta)
+        if extra_action_result is not None:
+            yield sse_event("action_result", extra_action_result)
+        yield sse_event(
+            "message_end",
+            {
+                "requestId": request_id,
+                "sessionId": session_id,
+                "turnId": turn_id,
+                "userMessageId": user_message_id,
+                "assistantMessageId": user_message_id + 1,
+                "status": "success",
+                "actionCode": "GENERATE_PREPARATION_FORM",
+            },
+        )
+
+    if task_id in (None, ""):
+        async for chunk in finish(
+            base_delta("rejected", "生成失败：该操作需要关联检验任务。")
+        ):
+            yield chunk
+        return
+
+    source = "generate_preparation_form"
+    try:
+        form = await generate_preparation_form_backend(task_id, auth)
+    except (httpx.ConnectError, httpx.ConnectTimeout) as e:
+        print(
+            f"[preparation] 后端生成接口不可达（{TODO_BACKEND_BASE}），降级为本地数据: {e}",
+            flush=True,
+        )
+        form = local_generate_preparation_form(task_id)
+        source = "local_preparation_form"
+    except Exception as e:
+        print(f"[preparation] 检验单生成失败: {e}", flush=True)
+        async for chunk in finish(
+            base_delta("failed", "检验单生成失败，请稍后重试。")
+        ):
+            yield chunk
+        return
+
+    delta = base_delta("success", "检验单已生成，可进入预览页面查看。")
+    delta.update(
+        {
+            "preparationForm": form or None,
+            "refresh": ["preparationDocument", "overview"],
+            "source": source,
+        }
+    )
+    async for chunk in finish(
+        delta,
+        {
+            "actionCode": "GENERATE_PREPARATION_FORM",
+            "status": "success",
+            "message": "检验单已生成",
+            "payload": {"taskId": task_id, "preparationForm": form or None},
+        },
+    ):
+        yield chunk
+
+
+# ==================== 生成RA报告（GENERATE_RA_REPORT） ====================
+
+GENERATE_RA_REPORT_PATTERN = re.compile(
+    r"生成.{0,20}(RA\s*报告|检验报告|报告)|(RA\s*报告|检验报告|报告).{0,10}生成|(检[验查]内容|检[验查]项).{0,10}生成一?份?(RA\s*报告|检验报告|报告)",
+    re.IGNORECASE,
+)
+
+LOCAL_RA_REPORT_DOC_SEQ = {"value": 81000}
+
+
+def detect_generate_ra_report(req: ClassifyRequest) -> bool:
+    if req.actionCode == "GENERATE_RA_REPORT":
+        return True
+    if req.actionCode:
+        return False
+    text = req.content or ""
+    if not GENERATE_RA_REPORT_PATTERN.search(text):
+        return False
+    if GENERATE_FORM_EXCLUDE_PATTERN.search(text):
+        return False
+    return True
+
+
+async def generate_ra_report_backend(task_id, auth: str) -> dict:
+    async with httpx.AsyncClient(base_url=TODO_BACKEND_BASE, timeout=30) as client:
+        resp = await client.post(
+            f"/api/ai/ship-tasks/{task_id}/ra-report/generate",
+            headers=backend_headers(auth),
+        )
+        resp.raise_for_status()
+        return (resp.json() or {}).get("data") or {}
+
+
+def local_generate_ra_report(task_id) -> dict:
+    LOCAL_RA_REPORT_DOC_SEQ["value"] += 1
+    return {
+        "docId": LOCAL_RA_REPORT_DOC_SEQ["value"],
+        "docNo": f"RA-{task_id}-{datetime.now().strftime('%Y%m%d')}",
+        "versionNo": 1,
+        "status": "generated",
+        "viewType": "surveyor",
+    }
+
+
+async def stream_generate_ra_report(
+    req: ClassifyRequest, auth: str
+) -> AsyncGenerator[str, None]:
+    request_id = str(uuid.uuid4())
+    session_id = req.sessionId or int(datetime.now().timestamp() * 1000)
+    if isinstance(session_id, str) and session_id.isdigit():
+        session_id = int(session_id)
+    turn_id = int(datetime.now().timestamp() * 1000) + 1
+    user_message_id = turn_id + 1
+
+    yield sse_event(
+        "message_start",
+        {
+            "requestId": request_id,
+            "sessionId": session_id,
+            "turnId": turn_id,
+            "userMessageId": user_message_id,
+            "assistantMessageId": None,
+            "status": "running",
+        },
+    )
+
+    task_id = req.taskId
+    if isinstance(task_id, str) and task_id.isdigit():
+        task_id = int(task_id)
+
+    def base_delta(status: str, content: str) -> dict:
+        return {
+            "seq": 1,
+            "type": "action_result",
+            "actionCode": "GENERATE_RA_REPORT",
+            "actionName": "生成RA报告",
+            "status": status,
+            "content": content,
+            "taskId": task_id,
+            "raReport": None,
+        }
+
+    async def finish(delta: dict, extra_action_result: dict | None = None):
+        yield sse_event("answer_delta", delta)
+        if extra_action_result is not None:
+            yield sse_event("action_result", extra_action_result)
+        yield sse_event(
+            "message_end",
+            {
+                "requestId": request_id,
+                "sessionId": session_id,
+                "turnId": turn_id,
+                "userMessageId": user_message_id,
+                "assistantMessageId": user_message_id + 1,
+                "status": "success",
+                "actionCode": "GENERATE_RA_REPORT",
+            },
+        )
+
+    if task_id in (None, ""):
+        async for chunk in finish(
+            base_delta("rejected", "生成失败：该操作需要关联检验任务。")
+        ):
+            yield chunk
+        return
+
+    source = "generate_ra_report"
+    try:
+        report = await generate_ra_report_backend(task_id, auth)
+    except (httpx.ConnectError, httpx.ConnectTimeout) as e:
+        print(
+            f"[ra-report] 后端生成接口不可达（{TODO_BACKEND_BASE}），降级为本地数据: {e}",
+            flush=True,
+        )
+        report = local_generate_ra_report(task_id)
+        source = "local_ra_report"
+    except Exception as e:
+        print(f"[ra-report] RA报告生成失败: {e}", flush=True)
+        async for chunk in finish(
+            base_delta("failed", "RA报告生成失败，请稍后重试。")
+        ):
+            yield chunk
+        return
+
+    delta = base_delta("success", "RA报告已生成，可进入预览页面查看。")
+    delta.update(
+        {
+            "raReport": report or None,
+            "refresh": ["raReportDocument", "overview"],
+            "source": source,
+        }
+    )
+    async for chunk in finish(
+        delta,
+        {
+            "actionCode": "GENERATE_RA_REPORT",
+            "status": "success",
+            "message": "RA报告已生成",
+            "payload": {"taskId": task_id, "raReport": report or None},
+        },
+    ):
+        yield chunk
+
+
+# ==================== 上传资料（OPEN_UPLOAD_MATERIAL） ====================
+
+UPLOAD_MATERIAL_PATTERN = re.compile(
+    r"上传.{0,20}(资料|文件)|(资料|文件).{0,10}上传"
+)
+UPLOAD_MATERIAL_EXCLUDE_PATTERN = re.compile(
+    r"如何|怎么|怎样|需要哪些|哪些步骤|是什么|什么是|能不能|可以.*吗|？|\?|查看|已经上传|下载"
+)
+
+LOCAL_MATERIAL_FILE_SEQ = {"value": 82000}
+
+
+def detect_upload_material(req: ClassifyRequest) -> bool:
+    if req.actionCode == "OPEN_UPLOAD_MATERIAL":
+        return True
+    if req.actionCode:
+        return False
+    text = req.content or ""
+    if not UPLOAD_MATERIAL_PATTERN.search(text):
+        return False
+    if UPLOAD_MATERIAL_EXCLUDE_PATTERN.search(text):
+        return False
+    return True
+
+
+async def upload_material_backend(task_id, auth: str) -> dict:
+    async with httpx.AsyncClient(base_url=TODO_BACKEND_BASE, timeout=30) as client:
+        resp = await client.post(
+            f"/api/ai/ship-tasks/{task_id}/materials/upload",
+            headers=backend_headers(auth),
+        )
+        resp.raise_for_status()
+        return (resp.json() or {}).get("data") or {}
+
+
+def local_upload_material(task_id) -> dict:
+    LOCAL_MATERIAL_FILE_SEQ["value"] += 1
+    return {
+        "fileId": LOCAL_MATERIAL_FILE_SEQ["value"],
+        "fileName": f"检验资料-{task_id}.pdf",
+        "fileSize": 0,
+        "status": "uploaded",
+        "viewType": "surveyor",
+    }
+
+
+async def stream_upload_material(
+    req: ClassifyRequest, auth: str
+) -> AsyncGenerator[str, None]:
+    request_id = str(uuid.uuid4())
+    session_id = req.sessionId or int(datetime.now().timestamp() * 1000)
+    if isinstance(session_id, str) and session_id.isdigit():
+        session_id = int(session_id)
+    turn_id = int(datetime.now().timestamp() * 1000) + 1
+    user_message_id = turn_id + 1
+
+    yield sse_event(
+        "message_start",
+        {
+            "requestId": request_id,
+            "sessionId": session_id,
+            "turnId": turn_id,
+            "userMessageId": user_message_id,
+            "assistantMessageId": None,
+            "status": "running",
+        },
+    )
+
+    task_id = req.taskId
+    if isinstance(task_id, str) and task_id.isdigit():
+        task_id = int(task_id)
+
+    def base_delta(status: str, content: str) -> dict:
+        return {
+            "seq": 1,
+            "type": "action_result",
+            "actionCode": "OPEN_UPLOAD_MATERIAL",
+            "actionName": "上传资料",
+            "status": status,
+            "content": content,
+            "taskId": task_id,
+            "material": None,
+        }
+
+    async def finish(delta: dict, extra_action_result: dict | None = None):
+        yield sse_event("answer_delta", delta)
+        if extra_action_result is not None:
+            yield sse_event("action_result", extra_action_result)
+        yield sse_event(
+            "message_end",
+            {
+                "requestId": request_id,
+                "sessionId": session_id,
+                "turnId": turn_id,
+                "userMessageId": user_message_id,
+                "assistantMessageId": user_message_id + 1,
+                "status": "success",
+                "actionCode": "OPEN_UPLOAD_MATERIAL",
+            },
+        )
+
+    if task_id in (None, ""):
+        async for chunk in finish(
+            base_delta("rejected", "操作失败：该操作需要关联检验任务。")
+        ):
+            yield chunk
+        return
+
+    source = "open_upload_material"
+    try:
+        material = await upload_material_backend(task_id, auth)
+    except (httpx.ConnectError, httpx.ConnectTimeout) as e:
+        print(
+            f"[material] 后端上传接口不可达（{TODO_BACKEND_BASE}），降级为本地数据: {e}",
+            flush=True,
+        )
+        material = local_upload_material(task_id)
+        source = "local_upload_material"
+    except Exception as e:
+        print(f"[material] 资料上传失败: {e}", flush=True)
+        async for chunk in finish(
+            base_delta("failed", "资料上传失败，请稍后重试。")
+        ):
+            yield chunk
+        return
+
+    delta = base_delta("success", "资料已上传成功，可进入预览页面查看。")
+    delta.update(
+        {
+            "material": material or None,
+            "refresh": ["materialDocument", "overview"],
+            "source": source,
+        }
+    )
+    async for chunk in finish(
+        delta,
+        {
+            "actionCode": "OPEN_UPLOAD_MATERIAL",
+            "status": "success",
+            "message": "资料已上传成功",
+            "payload": {"taskId": task_id, "material": material or None},
+        },
+    ):
+        yield chunk
+
+
+# ==================== 生成工作日志（GENERATE_WORK_LOG） ====================
+
+GENERATE_WORK_LOG_PATTERN = re.compile(
+    r"生成.{0,20}(工作日志|检验日志|日志|工作记录)|(工作日志|检验日志|日志|工作记录).{0,10}生成|(检[验查]内容|检[验查]项).{0,10}生成一?份?(工作日志|检验日志|日志)"
+)
+
+LOCAL_WORK_LOG_DOC_SEQ = {"value": 83000}
+
+
+def detect_generate_work_log(req: ClassifyRequest) -> bool:
+    if req.actionCode == "GENERATE_WORK_LOG":
+        return True
+    if req.actionCode:
+        return False
+    text = req.content or ""
+    if not GENERATE_WORK_LOG_PATTERN.search(text):
+        return False
+    if GENERATE_FORM_EXCLUDE_PATTERN.search(text):
+        return False
+    return True
+
+
+async def generate_work_log_backend(task_id, auth: str) -> dict:
+    async with httpx.AsyncClient(base_url=TODO_BACKEND_BASE, timeout=30) as client:
+        resp = await client.post(
+            f"/api/ai/ship-tasks/{task_id}/work-log/generate",
+            headers=backend_headers(auth),
+        )
+        resp.raise_for_status()
+        return (resp.json() or {}).get("data") or {}
+
+
+def local_generate_work_log(task_id) -> dict:
+    LOCAL_WORK_LOG_DOC_SEQ["value"] += 1
+    return {
+        "docId": LOCAL_WORK_LOG_DOC_SEQ["value"],
+        "docNo": f"WL-{task_id}-{datetime.now().strftime('%Y%m%d')}",
+        "versionNo": 1,
+        "status": "generated",
+        "viewType": "surveyor",
+    }
+
+
+async def stream_generate_work_log(
+    req: ClassifyRequest, auth: str
+) -> AsyncGenerator[str, None]:
+    request_id = str(uuid.uuid4())
+    session_id = req.sessionId or int(datetime.now().timestamp() * 1000)
+    if isinstance(session_id, str) and session_id.isdigit():
+        session_id = int(session_id)
+    turn_id = int(datetime.now().timestamp() * 1000) + 1
+    user_message_id = turn_id + 1
+
+    yield sse_event(
+        "message_start",
+        {
+            "requestId": request_id,
+            "sessionId": session_id,
+            "turnId": turn_id,
+            "userMessageId": user_message_id,
+            "assistantMessageId": None,
+            "status": "running",
+        },
+    )
+
+    task_id = req.taskId
+    if isinstance(task_id, str) and task_id.isdigit():
+        task_id = int(task_id)
+
+    def base_delta(status: str, content: str) -> dict:
+        return {
+            "seq": 1,
+            "type": "action_result",
+            "actionCode": "GENERATE_WORK_LOG",
+            "actionName": "生成工作日志",
+            "status": status,
+            "content": content,
+            "taskId": task_id,
+            "workLog": None,
+        }
+
+    async def finish(delta: dict, extra_action_result: dict | None = None):
+        yield sse_event("answer_delta", delta)
+        if extra_action_result is not None:
+            yield sse_event("action_result", extra_action_result)
+        yield sse_event(
+            "message_end",
+            {
+                "requestId": request_id,
+                "sessionId": session_id,
+                "turnId": turn_id,
+                "userMessageId": user_message_id,
+                "assistantMessageId": user_message_id + 1,
+                "status": "success",
+                "actionCode": "GENERATE_WORK_LOG",
+            },
+        )
+
+    if task_id in (None, ""):
+        async for chunk in finish(
+            base_delta("rejected", "生成失败：该操作需要关联检验任务。")
+        ):
+            yield chunk
+        return
+
+    source = "generate_work_log"
+    try:
+        work_log = await generate_work_log_backend(task_id, auth)
+    except (httpx.ConnectError, httpx.ConnectTimeout) as e:
+        print(
+            f"[work-log] 后端生成接口不可达（{TODO_BACKEND_BASE}），降级为本地数据: {e}",
+            flush=True,
+        )
+        work_log = local_generate_work_log(task_id)
+        source = "local_work_log"
+    except Exception as e:
+        print(f"[work-log] 工作日志生成失败: {e}", flush=True)
+        async for chunk in finish(
+            base_delta("failed", "工作日志生成失败，请稍后重试。")
+        ):
+            yield chunk
+        return
+
+    delta = base_delta("success", "工作日志已生成，可进入预览页面查看。")
+    delta.update(
+        {
+            "workLog": work_log or None,
+            "refresh": ["workLogDocument", "overview"],
+            "source": source,
+        }
+    )
+    async for chunk in finish(
+        delta,
+        {
+            "actionCode": "GENERATE_WORK_LOG",
+            "status": "success",
+            "message": "工作日志已生成",
+            "payload": {"taskId": task_id, "workLog": work_log or None},
+        },
+    ):
+        yield chunk
+
+
+# ==================== 完成检验任务（COMPLETE_INSPECTION_TASK） ====================
+
+COMPLETE_INSPECTION_PATTERN = re.compile(
+    r"(完成|结束|关闭).{0,10}(检验|验船)|检验.{0,6}(完成|结束|关闭)|(完成|结束)现场检验"
+)
+COMPLETE_INSPECTION_EXCLUDE_PATTERN = re.compile(
+    r"如何|怎么|怎样|需要哪些|哪些步骤|是什么|什么是|什么意思|能不能|可以.*吗|？|\?|查看|想看|已经完成|已完成|生成|报告|保存|推送"
+)
+
+
+def detect_complete_inspection(req: ClassifyRequest) -> bool:
+    if req.actionCode == "COMPLETE_INSPECTION_TASK":
+        return True
+    if req.actionCode:
+        return False
+    text = req.content or ""
+    if not COMPLETE_INSPECTION_PATTERN.search(text):
+        return False
+    if COMPLETE_INSPECTION_EXCLUDE_PATTERN.search(text):
+        return False
+    return True
+
+
+async def close_check_backend(task_id, auth: str) -> dict:
+    async with httpx.AsyncClient(base_url=TODO_BACKEND_BASE, timeout=30) as client:
+        resp = await client.post(
+            f"/api/ai/ship-tasks/{task_id}/close-check",
+            headers=backend_headers(auth),
+        )
+        resp.raise_for_status()
+        return (resp.json() or {}).get("data") or {}
+
+
+async def close_task_backend(task_id, auth: str) -> dict:
+    async with httpx.AsyncClient(base_url=TODO_BACKEND_BASE, timeout=30) as client:
+        resp = await client.post(
+            f"/api/ai/ship-tasks/{task_id}/close",
+            headers=backend_headers(auth),
+        )
+        resp.raise_for_status()
+        return (resp.json() or {}).get("data") or {}
+
+
+async def fetch_legacy_items(task_id, auth: str) -> list:
+    async with httpx.AsyncClient(base_url=TODO_BACKEND_BASE, timeout=10) as client:
+        resp = await client.get(
+            f"/api/ai/ship-tasks/{task_id}/legacy-items",
+            headers=backend_headers(auth),
+        )
+        resp.raise_for_status()
+        data = (resp.json() or {}).get("data")
+        if isinstance(data, dict):
+            return data.get("list") or []
+        return data or []
+
+
+def local_complete_inspection(task_id) -> tuple[dict, dict]:
+    tree = local_check_item_tree(task_id)
+    overview = local_task_overview(task_id, tree)
+    task_detail = {
+        "taskNo": f"LOCAL-TASK-{task_id}",
+        "shipName": "本地测试船舶",
+        "status": "archive",
+        "statusName": "待归档",
+    }
+    return overview, task_detail
+
+
+async def stream_complete_inspection(
+    req: ClassifyRequest, auth: str
+) -> AsyncGenerator[str, None]:
+    request_id = str(uuid.uuid4())
+    session_id = req.sessionId or int(datetime.now().timestamp() * 1000)
+    if isinstance(session_id, str) and session_id.isdigit():
+        session_id = int(session_id)
+    turn_id = int(datetime.now().timestamp() * 1000) + 1
+    user_message_id = turn_id + 1
+
+    yield sse_event(
+        "message_start",
+        {
+            "requestId": request_id,
+            "sessionId": session_id,
+            "turnId": turn_id,
+            "userMessageId": user_message_id,
+            "assistantMessageId": None,
+            "status": "running",
+        },
+    )
+
+    task_id = req.taskId
+    if isinstance(task_id, str) and task_id.isdigit():
+        task_id = int(task_id)
+
+    def base_delta(status: str, content: str) -> dict:
+        return {
+            "seq": 1,
+            "type": "action_result",
+            "actionCode": "COMPLETE_INSPECTION_TASK",
+            "actionName": "完成检验任务",
+            "status": status,
+            "content": content,
+            "taskId": task_id,
+            "overview": None,
+        }
+
+    async def finish(delta: dict, extra_action_result: dict | None = None):
+        yield sse_event("answer_delta", delta)
+        if extra_action_result is not None:
+            yield sse_event("action_result", extra_action_result)
+        yield sse_event(
+            "message_end",
+            {
+                "requestId": request_id,
+                "sessionId": session_id,
+                "turnId": turn_id,
+                "userMessageId": user_message_id,
+                "assistantMessageId": user_message_id + 1,
+                "status": "success",
+                "actionCode": "COMPLETE_INSPECTION_TASK",
+            },
+        )
+
+    if task_id in (None, ""):
+        async for chunk in finish(
+            base_delta("rejected", "完成失败：该操作需要关联检验任务。")
+        ):
+            yield chunk
+        return
+
+    source = "complete_inspection_task"
+    overview = None
+    task_detail = None
+    try:
+        check_result = await close_check_backend(task_id, auth)
+        try:
+            overview = await fetch_task_overview(task_id, auth)
+        except Exception as e:
+            print(f"[complete] 检验项统计查询失败: {e}", flush=True)
+        try:
+            legacy_items = await fetch_legacy_items(task_id, auth)
+            if overview is not None and "legacyItemCount" not in overview:
+                overview["legacyItemCount"] = len(legacy_items)
+        except Exception as e:
+            print(f"[complete] 问题记录统计查询失败: {e}", flush=True)
+
+        passed = check_result.get("passed")
+        if passed is None:
+            passed = check_result.get("canClose", True)
+        if not passed:
+            reason = check_result.get("reason") or check_result.get("message") or ""
+            if "签署" in reason:
+                content = "完成失败：校验未通过，尚未完成检验签署。"
+            elif reason:
+                content = f"完成失败：校验未通过，{reason}"
+            else:
+                content = "完成失败：校验未通过，仍有遗留问题未确认。"
+            delta = base_delta("rejected", content)
+            delta.update(
+                {"overview": overview, "refresh": ["overview"], "source": source}
+            )
+            async for chunk in finish(delta):
+                yield chunk
+            return
+
+        close_result = await close_task_backend(task_id, auth)
+        task_detail = close_result.get("taskDetail") or close_result or None
+    except (httpx.ConnectError, httpx.ConnectTimeout) as e:
+        print(
+            f"[complete] 后端完成检验接口不可达（{TODO_BACKEND_BASE}），降级为本地数据: {e}",
+            flush=True,
+        )
+        overview, task_detail = local_complete_inspection(task_id)
+        source = "local_complete_inspection"
+    except Exception as e:
+        print(f"[complete] 检验任务完成失败: {e}", flush=True)
+        async for chunk in finish(
+            base_delta("failed", "检验任务完成失败，请稍后重试。")
+        ):
+            yield chunk
+        return
+
+    delta = base_delta("success", "检验任务已完成，资料已进入归档阶段。")
+    delta.update(
+        {
+            "overview": overview,
+            "taskDetail": task_detail,
+            "refresh": ["taskStatus", "overview", "archive"],
+            "source": source,
+        }
+    )
+    async for chunk in finish(
+        delta,
+        {
+            "actionCode": "COMPLETE_INSPECTION_TASK",
+            "status": "success",
+            "message": "检验任务已完成",
+            "payload": {
+                "taskId": task_id,
+                "overview": overview,
+                "taskDetail": task_detail,
+            },
+        },
+    ):
+        yield chunk
+
+
+# ==================== 查看检验项概览（VIEW_CHECK_ITEMS_OVERVIEW） ====================
+
+VIEW_CHECK_OVERVIEW_PATTERN = re.compile(
+    r"(查看|看看|看一下|统计).{0,15}(检[验查]项|检查项)(概览|统计|列表|树|数量)?|"
+    r"(检[验查]项|检查项).{0,10}(概览|统计|列表|树|数量)"
+)
+VIEW_CHECK_OVERVIEW_EXCLUDE_PATTERN = re.compile(
+    r"如何|怎么|怎样|需要哪些|哪些步骤|是什么|什么是|什么意思|能不能|可以.*吗|？|\?|新增|添加|删除|保存|报告|日志|检验单"
+)
+
+
+def detect_view_check_items_overview(req: ClassifyRequest) -> bool:
+    if req.actionCode == "VIEW_CHECK_ITEMS_OVERVIEW":
+        return True
+    if req.actionCode:
+        return False
+    text = req.content or ""
+    if not VIEW_CHECK_OVERVIEW_PATTERN.search(text):
+        return False
+    if VIEW_CHECK_OVERVIEW_EXCLUDE_PATTERN.search(text):
+        return False
+    return True
+
+
+async def fetch_task_overview(task_id, auth: str) -> dict:
+    async with httpx.AsyncClient(base_url=TODO_BACKEND_BASE, timeout=10) as client:
+        resp = await client.get(
+            f"/api/ai/ship-tasks/{task_id}/overview",
+            headers=backend_headers(auth),
+        )
+        resp.raise_for_status()
+        return (resp.json() or {}).get("data") or {}
+
+
+def local_task_overview(task_id, tree: list) -> dict:
+    flat = flatten_check_item_tree(tree)
+    completed = sum(1 for i in flat if i.get("status") == "completed")
+    rejected = sum(1 for i in flat if i.get("status") == "rejected")
+    pending = sum(1 for i in flat if i.get("status") not in ("completed", "rejected"))
+    return {
+        "checkItemCount": len(flat),
+        "completedCount": completed,
+        "pendingCount": pending,
+        "rejectedCount": rejected,
+        "legacyItemCount": 0,
+        "issueCount": 0,
+    }
+
+
+async def stream_view_check_items_overview(
+    req: ClassifyRequest, auth: str
+) -> AsyncGenerator[str, None]:
+    request_id = str(uuid.uuid4())
+    session_id = req.sessionId or int(datetime.now().timestamp() * 1000)
+    if isinstance(session_id, str) and session_id.isdigit():
+        session_id = int(session_id)
+    turn_id = int(datetime.now().timestamp() * 1000) + 1
+    user_message_id = turn_id + 1
+
+    yield sse_event(
+        "message_start",
+        {
+            "requestId": request_id,
+            "sessionId": session_id,
+            "turnId": turn_id,
+            "userMessageId": user_message_id,
+            "assistantMessageId": None,
+            "status": "running",
+        },
+    )
+
+    task_id = req.taskId
+    if isinstance(task_id, str) and task_id.isdigit():
+        task_id = int(task_id)
+
+    def base_delta(status: str, content: str) -> dict:
+        return {
+            "seq": 1,
+            "type": "action_result",
+            "actionCode": "VIEW_CHECK_ITEMS_OVERVIEW",
+            "actionName": "查看检验项概览",
+            "status": status,
+            "content": content,
+            "taskId": task_id,
+            "overview": None,
+            "checkItemTree": [],
+        }
+
+    async def finish(delta: dict, extra_action_result: dict | None = None):
+        yield sse_event("answer_delta", delta)
+        if extra_action_result is not None:
+            yield sse_event("action_result", extra_action_result)
+        yield sse_event(
+            "message_end",
+            {
+                "requestId": request_id,
+                "sessionId": session_id,
+                "turnId": turn_id,
+                "userMessageId": user_message_id,
+                "assistantMessageId": user_message_id + 1,
+                "status": "success",
+                "actionCode": "VIEW_CHECK_ITEMS_OVERVIEW",
+            },
+        )
+
+    if task_id in (None, ""):
+        async for chunk in finish(
+            base_delta("rejected", "查询失败：该操作需要关联检验任务。")
+        ):
+            yield chunk
+        return
+
+    source = "view_check_items_overview"
+    try:
+        overview = await fetch_task_overview(task_id, auth)
+        tree = await fetch_check_item_tree(task_id, auth)
+    except (httpx.ConnectError, httpx.ConnectTimeout) as e:
+        print(
+            f"[overview] 后端概览接口不可达（{TODO_BACKEND_BASE}），降级为本地数据: {e}",
+            flush=True,
+        )
+        tree = local_check_item_tree(task_id)
+        overview = local_task_overview(task_id, tree)
+        source = "local_check_items"
+    except Exception as e:
+        print(f"[overview] 检验项概览查询失败: {e}", flush=True)
+        async for chunk in finish(
+            base_delta("failed", "检验项概览查询失败，请稍后重试。")
+        ):
+            yield chunk
+        return
+
+    count = overview.get("checkItemCount")
+    if count is None:
+        count = len(flatten_check_item_tree(tree))
+    delta = base_delta(
+        "success", f"已为您查询到当前任务的检验项概览，共 {count} 条检查项。"
+    )
+    delta.update(
+        {
+            "overview": overview or None,
+            "checkItemTree": tree,
+            "refresh": ["checkItemOverview", "checkItemTree"],
+            "source": source,
+        }
+    )
+    async for chunk in finish(
+        delta,
+        {
+            "actionCode": "VIEW_CHECK_ITEMS_OVERVIEW",
+            "status": "success",
+            "message": "检验项概览查询成功",
+            "payload": {
+                "taskId": task_id,
+                "overview": overview or None,
+                "checkItemTree": tree,
+            },
+        },
+    ):
+        yield chunk
+
+
+# ==================== 问题记录（RECORD_ISSUE） ====================
+
+RECORD_ISSUE_PATTERN = re.compile(
+    r"发现.{0,20}(问题|缺陷|隐患|裂纹|松动|锈蚀|损坏)|"
+    r"(记录|报告|登记).{0,10}(一个|一条)?(问题|缺陷|隐患)|"
+    r"(这里|这个地方|此处).{0,5}有问题|有问题.{0,5}(要|需要)?(记录|上报)"
+)
+RECORD_ISSUE_EXCLUDE_PATTERN = re.compile(
+    r"如何|怎么|怎样|需要哪些|哪些信息|哪些步骤|是什么|什么是|什么意思|能不能|可以.*吗|？|\?|查看|想看|已记录|已经记录|列表|确认.{0,5}整改|关闭问题"
+)
+
+SEVERITY_NAMES = {"high": "高", "medium": "中", "low": "低"}
+SEVERITY_TEXT_MAP = [
+    (re.compile(r"严重程度[：: ]?[为是]?高|高风险|重大"), "high"),
+    (re.compile(r"严重程度[：: ]?[为是]?中|中等|一般"), "medium"),
+    (re.compile(r"严重程度[：: ]?[为是]?低|轻微|低风险"), "low"),
+]
+
+
+def detect_record_issue(req: ClassifyRequest) -> bool:
+    if req.actionCode == "RECORD_ISSUE":
+        return True
+    if req.actionCode:
+        return False
+    text = req.content or ""
+    if not RECORD_ISSUE_PATTERN.search(text):
+        return False
+    if RECORD_ISSUE_EXCLUDE_PATTERN.search(text):
+        return False
+    return True
+
+
+def parse_issue_params(content: str, params: dict) -> dict:
+    desc = (params.get("issueDescription") or "").strip()
+    severity = (params.get("severityLevel") or "").strip()
+    location = (params.get("location") or "").strip()
+    text = content or ""
+
+    if not desc:
+        m = re.search(
+            r"(?:发现|记录|报告|登记)(?:问题|一个问题|一条问题)?[：:，,]?\s*(.+)", text
+        )
+        if m:
+            desc = m.group(1).strip()
+            desc = re.split(r"[，,。；;]\s*(?:严重程度|位置)", desc)[0].strip()
+        if re.fullmatch(r"(一个|一条)?(问题|缺陷|隐患)?", desc):
+            desc = ""
+    if not severity:
+        for pattern, level in SEVERITY_TEXT_MAP:
+            if pattern.search(text):
+                severity = level
+                break
+    if not severity:
+        severity = "medium"
+    if not location:
+        m = re.search(r"位置(?:在|为|是)?[：:]?\s*([^，,。；;]+)", text)
+        if m:
+            location = m.group(1).strip()
+    return {
+        "issueDescription": desc,
+        "severityLevel": severity,
+        "location": location,
+        "photos": params.get("photos") or [],
+    }
+
+
+async def record_issue_backend(task_id, issue: dict, auth: str) -> dict:
+    async with httpx.AsyncClient(base_url=TODO_BACKEND_BASE, timeout=30) as client:
+        resp = await client.post(
+            f"/api/ai/ship-tasks/{task_id}/issues",
+            json={
+                "checkItemId": None,
+                "checkItemCode": None,
+                "checkItemName": None,
+                "severity": issue["severityLevel"],
+                "riskLevel": issue["severityLevel"],
+                "problemDesc": issue["issueDescription"],
+                "location": issue["location"],
+                "photos": issue["photos"],
+                "regulationBasis": "",
+                "rectificationAdvice": "",
+                "source": "ai",
+            },
+            headers=backend_headers(auth),
+        )
+        resp.raise_for_status()
+        return (resp.json() or {}).get("data") or {}
+
+
+LOCAL_ISSUE_ID_SEQ = {"value": 20000}
+
+
+def local_record_issue(issue: dict) -> dict:
+    LOCAL_ISSUE_ID_SEQ["value"] += 1
+    severity = issue["severityLevel"]
+    return {
+        "issueId": LOCAL_ISSUE_ID_SEQ["value"],
+        "problemDesc": issue["issueDescription"],
+        "severity": severity,
+        "severityName": SEVERITY_NAMES.get(severity, ""),
+        "location": issue["location"],
+        "riskLevel": severity,
+        "riskLevelName": SEVERITY_NAMES.get(severity, ""),
+        "status": "pending",
+    }
+
+
+async def stream_record_issue(
+    req: ClassifyRequest, auth: str
+) -> AsyncGenerator[str, None]:
+    request_id = str(uuid.uuid4())
+    session_id = req.sessionId or int(datetime.now().timestamp() * 1000)
+    if isinstance(session_id, str) and session_id.isdigit():
+        session_id = int(session_id)
+    turn_id = int(datetime.now().timestamp() * 1000) + 1
+    user_message_id = turn_id + 1
+
+    yield sse_event(
+        "message_start",
+        {
+            "requestId": request_id,
+            "sessionId": session_id,
+            "turnId": turn_id,
+            "userMessageId": user_message_id,
+            "assistantMessageId": None,
+            "status": "running",
+        },
+    )
+
+    task_id = req.taskId
+    if isinstance(task_id, str) and task_id.isdigit():
+        task_id = int(task_id)
+
+    def base_delta(status: str, content: str) -> dict:
+        return {
+            "seq": 1,
+            "type": "action_result",
+            "actionCode": "RECORD_ISSUE",
+            "actionName": "问题记录",
+            "status": status,
+            "content": content,
+            "taskId": task_id,
+            "issue": None,
+        }
+
+    async def finish(delta: dict, extra_action_result: dict | None = None):
+        yield sse_event("answer_delta", delta)
+        if extra_action_result is not None:
+            yield sse_event("action_result", extra_action_result)
+        yield sse_event(
+            "message_end",
+            {
+                "requestId": request_id,
+                "sessionId": session_id,
+                "turnId": turn_id,
+                "userMessageId": user_message_id,
+                "assistantMessageId": user_message_id + 1,
+                "status": "success",
+                "actionCode": "RECORD_ISSUE",
+            },
+        )
+
+    if task_id in (None, ""):
+        async for chunk in finish(
+            base_delta("rejected", "记录失败：该操作需要关联检验任务。")
+        ):
+            yield chunk
+        return
+
+    issue_params = parse_issue_params(req.content or "", req.actionParams or {})
+    if not issue_params["issueDescription"]:
+        async for chunk in finish(
+            base_delta("rejected", "记录失败：缺少问题描述，请补充问题详情。")
+        ):
+            yield chunk
+        return
+
+    source = "record_issue"
+    try:
+        issue = await record_issue_backend(task_id, issue_params, auth)
+        if not issue:
+            issue = local_record_issue(issue_params)
+    except (httpx.ConnectError, httpx.ConnectTimeout) as e:
+        print(
+            f"[issue] 后端问题记录接口不可达（{TODO_BACKEND_BASE}），降级为本地数据: {e}",
+            flush=True,
+        )
+        issue = local_record_issue(issue_params)
+        source = "local_record_issue"
+    except Exception as e:
+        print(f"[issue] 问题记录失败: {e}", flush=True)
+        async for chunk in finish(
+            base_delta("failed", "问题记录失败，请稍后重试。")
+        ):
+            yield chunk
+        return
+
+    delta = base_delta("success", "问题已记录成功。")
+    delta.update(
+        {
+            "issue": issue,
+            "refresh": ["issues", "overview"],
+            "source": source,
+        }
+    )
+    async for chunk in finish(
+        delta,
+        {
+            "actionCode": "RECORD_ISSUE",
+            "status": "success",
+            "message": "问题已记录",
+            "payload": {"taskId": task_id, "issue": issue},
+        },
+    ):
+        yield chunk
+
+
+# ==================== 船只任务准备（BEGIN_TASK） ====================
+
+BEGIN_TASK_PATTERN = re.compile(r"开始准备\s*(.*?)\s*(?:的)?船只(?:的)?任务")
+
+
+def detect_begin_task(req: ClassifyRequest) -> bool:
+    if req.actionCode == "BEGIN_TASK":
+        return True
+    if req.actionCode:
+        return False
+    return bool(BEGIN_TASK_PATTERN.search(req.content or ""))
+
+
+def parse_ship_name(content: str, params: dict) -> str:
+    name = str(params.get("shipName") or "").strip()
+    if name:
+        return name
+    m = BEGIN_TASK_PATTERN.search(content or "")
+    if m:
+        return m.group(1).strip()
+    return ""
+
+
+async def stream_begin_task(
+    req: ClassifyRequest, auth: str
+) -> AsyncGenerator[str, None]:
+    request_id = str(uuid.uuid4())
+    session_id = req.sessionId or int(datetime.now().timestamp() * 1000)
+    if isinstance(session_id, str) and session_id.isdigit():
+        session_id = int(session_id)
+    turn_id = int(datetime.now().timestamp() * 1000) + 1
+    user_message_id = turn_id + 1
+
+    task_id = req.taskId
+    if isinstance(task_id, str) and task_id.isdigit():
+        task_id = int(task_id)
+
+    yield sse_event(
+        "message_start",
+        {
+            "requestId": request_id,
+            "sessionId": session_id,
+            "turnId": turn_id,
+            "userMessageId": user_message_id,
+            "assistantMessageId": None,
+            "status": "running",
+        },
+    )
+
+    ship_name = parse_ship_name(req.content or "", req.actionParams or {})
+
+    yield sse_event(
+        "answer_delta",
+        {
+            "seq": 1,
+            "type": "action_result",
+            "actionCode": "BEGIN_TASK",
+            "actionName": "船只任务准备",
+            "status": "success",
+            "content": "",
+            "taskId": task_id,
+            "shipName": ship_name or None,
+        },
+    )
+
+    if ship_name:
+        chunks = [
+            "好的，",
+            f"已为您启动「{ship_name}」船只的准备任务。",
+            "正在加载作业清单、检查设备状态与排期…",
+            "准备完成后将自动通知您。",
+        ]
+    else:
+        chunks = [
+            "已收到开始准备船只任务的指令，",
+            "但未识别到船只名称或编号，",
+            "请告诉我需要准备哪一艘船只的任务（如：开始准备东海01船只任务）。",
+        ]
+    for chunk in chunks:
+        yield sse_event("answer_delta", {"content": chunk})
+        await asyncio.sleep(0.05)
+
+    yield sse_event("answer_delta", {"content": "[DONE]"})
+
+    yield sse_event(
+        "message_end",
+        {
+            "requestId": request_id,
+            "sessionId": session_id,
+            "turnId": turn_id,
+            "userMessageId": user_message_id,
+            "assistantMessageId": user_message_id + 1,
+            "status": "success",
+            "actionCode": "BEGIN_TASK",
+        },
+    )
+
+
+# ==================== 确认整改遗留问题（CONFIRM_RECTIFICATION_ISSUES） ====================
+
+CONFIRM_RECTIFICATION_PATTERN = re.compile(
+    r"确认.{0,15}(遗留|整改)|(遗留问题|遗留项|这些问题).{0,10}(已经?整改|已确认|整改完成)|"
+    r"标记.{0,10}(遗留问题|遗留项).{0,10}已确认|完成.{0,10}(遗留问题|遗留项).{0,5}整改"
+)
+CONFIRM_RECTIFICATION_EXCLUDE_PATTERN = re.compile(
+    r"如何|怎么|怎样|需要哪些|哪些步骤|是什么|什么是|什么意思|能不能|可以.*吗|？|\?|查看|想看|列表|未整改|没整改|还没整改|无法整改|新增遗留"
+)
+
+
+def detect_confirm_rectification(req: ClassifyRequest) -> bool:
+    if req.actionCode == "CONFIRM_RECTIFICATION_ISSUES":
+        return True
+    if req.actionCode:
+        return False
+    text = req.content or ""
+    if not CONFIRM_RECTIFICATION_PATTERN.search(text):
+        return False
+    if CONFIRM_RECTIFICATION_EXCLUDE_PATTERN.search(text):
+        return False
+    return True
+
+
+async def confirm_rectification_backend(
+    task_id, issue_ids: list, note: str, auth: str
+) -> dict:
+    async with httpx.AsyncClient(base_url=TODO_BACKEND_BASE, timeout=30) as client:
+        resp = await client.post(
+            f"/api/ai/ship-tasks/{task_id}/legacy-items/batch-confirm",
+            json={
+                "legacyItemIds": issue_ids,
+                "status": "confirmed",
+                "remark": note or "",
+                "source": "ai",
+            },
+            headers=backend_headers(auth),
+        )
+        resp.raise_for_status()
+        return (resp.json() or {}).get("data") or {}
+
+
+def local_confirm_rectification(issue_ids: list, note: str) -> list:
+    return [
+        {
+            "legacyItemId": issue_id,
+            "legacyCode": f"LEG-{issue_id}",
+            "title": f"遗留问题 {issue_id}",
+            "confirmStatus": "confirmed",
+            "confirmRemark": note or "",
+        }
+        for issue_id in issue_ids
+    ]
+
+
+async def stream_confirm_rectification(
+    req: ClassifyRequest, auth: str
+) -> AsyncGenerator[str, None]:
+    request_id = str(uuid.uuid4())
+    session_id = req.sessionId or int(datetime.now().timestamp() * 1000)
+    if isinstance(session_id, str) and session_id.isdigit():
+        session_id = int(session_id)
+    turn_id = int(datetime.now().timestamp() * 1000) + 1
+    user_message_id = turn_id + 1
+
+    yield sse_event(
+        "message_start",
+        {
+            "requestId": request_id,
+            "sessionId": session_id,
+            "turnId": turn_id,
+            "userMessageId": user_message_id,
+            "assistantMessageId": None,
+            "status": "running",
+        },
+    )
+
+    task_id = req.taskId
+    if isinstance(task_id, str) and task_id.isdigit():
+        task_id = int(task_id)
+
+    def base_delta(status: str, content: str) -> dict:
+        return {
+            "seq": 1,
+            "type": "action_result",
+            "actionCode": "CONFIRM_RECTIFICATION_ISSUES",
+            "actionName": "确认整改遗留问题",
+            "status": status,
+            "content": content,
+            "taskId": task_id,
+            "confirmedCount": 0,
+            "confirmedItems": [],
+        }
+
+    async def finish(delta: dict, extra_action_result: dict | None = None):
+        yield sse_event("answer_delta", delta)
+        if extra_action_result is not None:
+            yield sse_event("action_result", extra_action_result)
+        yield sse_event(
+            "message_end",
+            {
+                "requestId": request_id,
+                "sessionId": session_id,
+                "turnId": turn_id,
+                "userMessageId": user_message_id,
+                "assistantMessageId": user_message_id + 1,
+                "status": "success",
+                "actionCode": "CONFIRM_RECTIFICATION_ISSUES",
+            },
+        )
+
+    if task_id in (None, ""):
+        async for chunk in finish(
+            base_delta("rejected", "确认失败：该操作需要关联检验任务。")
+        ):
+            yield chunk
+        return
+
+    params = req.actionParams or {}
+    issue_ids = params.get("issueIds") or []
+    if not isinstance(issue_ids, list):
+        issue_ids = [issue_ids]
+    issue_ids = [int(i) if isinstance(i, str) and i.isdigit() else i for i in issue_ids]
+    note = params.get("confirmNote") or ""
+
+    if not issue_ids:
+        async for chunk in finish(
+            base_delta("rejected", "确认失败：缺少需要确认的遗留项ID列表。")
+        ):
+            yield chunk
+        return
+
+    source = "confirm_rectification_issues"
+    try:
+        result = await confirm_rectification_backend(task_id, issue_ids, note, auth)
+        confirmed_items = result.get("list") or result.get("items") or []
+        if not confirmed_items:
+            confirmed_items = local_confirm_rectification(issue_ids, note)
+    except (httpx.ConnectError, httpx.ConnectTimeout) as e:
+        print(
+            f"[legacy] 后端确认接口不可达（{TODO_BACKEND_BASE}），降级为本地数据: {e}",
+            flush=True,
+        )
+        confirmed_items = local_confirm_rectification(issue_ids, note)
+        source = "local_confirm_rectification"
+    except Exception as e:
+        print(f"[legacy] 遗留问题确认失败: {e}", flush=True)
+        async for chunk in finish(
+            base_delta("failed", "遗留问题确认失败，请稍后重试。")
+        ):
+            yield chunk
+        return
+
+    count = len(confirmed_items)
+    delta = base_delta("success", f"已确认 {count} 项遗留问题整改完成。")
+    delta.update(
+        {
+            "confirmedCount": count,
+            "confirmedItems": confirmed_items,
+            "refresh": ["legacyItems", "overview"],
+            "source": source,
+        }
+    )
+    async for chunk in finish(
+        delta,
+        {
+            "actionCode": "CONFIRM_RECTIFICATION_ISSUES",
+            "status": "success",
+            "message": "遗留问题已确认整改完成",
+            "payload": {
+                "taskId": task_id,
+                "confirmedCount": count,
+                "confirmedItems": confirmed_items,
+            },
+        },
+    ):
+        yield chunk
+
+
+# ==================== 未整改遗留问题（PENDING_RECTIFICATION_ISSUES） ====================
+
+PENDING_RECTIFICATION_PATTERN = re.compile(
+    r"(标记|设置|记录)?.{0,10}(未整改|没整改|还没整改|没有整改|未完成整改|无法整改)|"
+    r"未整改.{0,10}(遗留|问题)|(遗留问题|遗留项).{0,15}(未整改|没整改|还没整改|无法整改)"
+)
+PENDING_RECTIFICATION_EXCLUDE_PATTERN = re.compile(
+    r"如何|怎么|怎样|需要哪些|哪些步骤|是什么|什么是|什么意思|能不能|可以.*吗|？|\?|查看|想看|列表|确认整改|整改完成|新增遗留"
+)
+
+
+def detect_pending_rectification(req: ClassifyRequest) -> bool:
+    if req.actionCode == "PENDING_RECTIFICATION_ISSUES":
+        return True
+    if req.actionCode:
+        return False
+    text = req.content or ""
+    if not PENDING_RECTIFICATION_PATTERN.search(text):
+        return False
+    if PENDING_RECTIFICATION_EXCLUDE_PATTERN.search(text):
+        return False
+    return True
+
+
+async def pending_rectification_backend(
+    task_id, issue_ids: list, reason: str, auth: str
+) -> dict:
+    async with httpx.AsyncClient(base_url=TODO_BACKEND_BASE, timeout=30) as client:
+        resp = await client.post(
+            f"/api/ai/ship-tasks/{task_id}/legacy-items/batch-confirm",
+            json={
+                "legacyItemIds": issue_ids,
+                "status": "unconfirmed",
+                "remark": reason or "",
+                "source": "ai",
+            },
+            headers=backend_headers(auth),
+        )
+        resp.raise_for_status()
+        return (resp.json() or {}).get("data") or {}
+
+
+def local_pending_rectification(issue_ids: list, reason: str) -> list:
+    return [
+        {
+            "legacyItemId": issue_id,
+            "legacyCode": f"LEG-{issue_id}",
+            "title": f"遗留问题 {issue_id}",
+            "confirmStatus": "unconfirmed",
+            "confirmRemark": reason or "",
+        }
+        for issue_id in issue_ids
+    ]
+
+
+async def stream_pending_rectification(
+    req: ClassifyRequest, auth: str
+) -> AsyncGenerator[str, None]:
+    request_id = str(uuid.uuid4())
+    session_id = req.sessionId or int(datetime.now().timestamp() * 1000)
+    if isinstance(session_id, str) and session_id.isdigit():
+        session_id = int(session_id)
+    turn_id = int(datetime.now().timestamp() * 1000) + 1
+    user_message_id = turn_id + 1
+
+    yield sse_event(
+        "message_start",
+        {
+            "requestId": request_id,
+            "sessionId": session_id,
+            "turnId": turn_id,
+            "userMessageId": user_message_id,
+            "assistantMessageId": None,
+            "status": "running",
+        },
+    )
+
+    task_id = req.taskId
+    if isinstance(task_id, str) and task_id.isdigit():
+        task_id = int(task_id)
+
+    def base_delta(status: str, content: str) -> dict:
+        return {
+            "seq": 1,
+            "type": "action_result",
+            "actionCode": "PENDING_RECTIFICATION_ISSUES",
+            "actionName": "未整改遗留问题",
+            "status": status,
+            "content": content,
+            "taskId": task_id,
+            "pendingCount": 0,
+            "pendingItems": [],
+        }
+
+    async def finish(delta: dict, extra_action_result: dict | None = None):
+        yield sse_event("answer_delta", delta)
+        if extra_action_result is not None:
+            yield sse_event("action_result", extra_action_result)
+        yield sse_event(
+            "message_end",
+            {
+                "requestId": request_id,
+                "sessionId": session_id,
+                "turnId": turn_id,
+                "userMessageId": user_message_id,
+                "assistantMessageId": user_message_id + 1,
+                "status": "success",
+                "actionCode": "PENDING_RECTIFICATION_ISSUES",
+            },
+        )
+
+    if task_id in (None, ""):
+        async for chunk in finish(
+            base_delta("rejected", "标记失败：该操作需要关联检验任务。")
+        ):
+            yield chunk
+        return
+
+    params = req.actionParams or {}
+    issue_ids = params.get("issueIds") or []
+    if not isinstance(issue_ids, list):
+        issue_ids = [issue_ids]
+    issue_ids = [int(i) if isinstance(i, str) and i.isdigit() else i for i in issue_ids]
+    reason = params.get("pendingReason") or ""
+
+    if not issue_ids:
+        async for chunk in finish(
+            base_delta("rejected", "标记失败：缺少需要标记的遗留项ID列表。")
+        ):
+            yield chunk
+        return
+
+    source = "pending_rectification_issues"
+    try:
+        result = await pending_rectification_backend(task_id, issue_ids, reason, auth)
+        pending_items = result.get("list") or result.get("items") or []
+        if not pending_items:
+            pending_items = local_pending_rectification(issue_ids, reason)
+    except (httpx.ConnectError, httpx.ConnectTimeout) as e:
+        print(
+            f"[legacy] 后端标记接口不可达（{TODO_BACKEND_BASE}），降级为本地数据: {e}",
+            flush=True,
+        )
+        pending_items = local_pending_rectification(issue_ids, reason)
+        source = "local_pending_rectification"
+    except Exception as e:
+        print(f"[legacy] 遗留问题标记未整改失败: {e}", flush=True)
+        async for chunk in finish(
+            base_delta("failed", "遗留问题标记未整改失败，请稍后重试。")
+        ):
+            yield chunk
+        return
+
+    count = len(pending_items)
+    delta = base_delta("success", f"已标记 {count} 项遗留问题为未整改。")
+    delta.update(
+        {
+            "pendingCount": count,
+            "pendingItems": pending_items,
+            "refresh": ["legacyItems", "overview"],
+            "source": source,
+        }
+    )
+    async for chunk in finish(
+        delta,
+        {
+            "actionCode": "PENDING_RECTIFICATION_ISSUES",
+            "status": "success",
+            "message": "遗留问题已标记为未整改",
+            "payload": {
+                "taskId": task_id,
+                "pendingCount": count,
+                "pendingItems": pending_items,
+            },
+        },
+    ):
+        yield chunk
+
+
+# ==================== 开始检验（START_INSPECTION） ====================
+
+START_INSPECTION_PATTERN = re.compile(
+    r"(开始|进入|打开).{0,10}(检验|验船)|我要检验|开始验船|检验流程|检验页面"
+)
+START_INSPECTION_EXCLUDE_PATTERN = re.compile(
+    r"如何|怎么|怎样|需要哪些|哪些步骤|是什么|什么是|能不能|可以.*吗|？|\?|查看|已经完成|已完成|推送|保存"
+)
+
+
+def detect_start_inspection(req: ClassifyRequest) -> bool:
+    if req.actionCode == "START_INSPECTION":
+        return True
+    if req.actionCode:
+        return False
+    text = req.content or ""
+    if not START_INSPECTION_PATTERN.search(text):
+        return False
+    if START_INSPECTION_EXCLUDE_PATTERN.search(text):
+        return False
+    return True
+
+
+async def fetch_inspection_tasks(client_type: str, auth: str) -> list:
+    async with httpx.AsyncClient(base_url=TODO_BACKEND_BASE, timeout=10) as client:
+        resp = await client.get(
+            "/api/ai/ship-tasks",
+            params={
+                "clientType": client_type,
+                "status": "pending_inspection,inspection",
+                "page": 1,
+                "limit": 20,
+            },
+            headers=backend_headers(auth),
+        )
+        resp.raise_for_status()
+        data = (resp.json() or {}).get("data") or {}
+        return data.get("list") or []
+
+
+def local_inspection_tasks() -> list:
+    tasks = []
+    task_id = 0
+    for name, s in SHIPS.items():
+        task_id += 1
+        mapped = STATUS_CODE_MAP.get(s["状态"])
+        if not mapped or mapped[0] not in ("pending_inspection", "inspection"):
+            continue
+        code, code_name = mapped
+        tasks.append(
+            {
+                "taskId": task_id,
+                "taskNo": f"LOCAL-TASK-{task_id:04d}",
+                "shipName": name,
+                "ccsNo": s.get("CCSNO", ""),
+                "status": code,
+                "statusName": code_name,
+                "plannedInspectionDate": "",
+                "surveyorName": "张工",
+                "progressPercent": 0,
+            }
+        )
+    return tasks
+
+
+async def stream_start_inspection(
+    req: ClassifyRequest, auth: str
+) -> AsyncGenerator[str, None]:
+    request_id = str(uuid.uuid4())
+    session_id = req.sessionId or int(datetime.now().timestamp() * 1000)
+    if isinstance(session_id, str) and session_id.isdigit():
+        session_id = int(session_id)
+    turn_id = int(datetime.now().timestamp() * 1000) + 1
+    user_message_id = turn_id + 1
+
+    yield sse_event(
+        "message_start",
+        {
+            "requestId": request_id,
+            "sessionId": session_id,
+            "turnId": turn_id,
+            "userMessageId": user_message_id,
+            "assistantMessageId": None,
+            "status": "running",
+        },
+    )
+
+    def base_delta(status: str, content: str) -> dict:
+        return {
+            "seq": 1,
+            "type": "action_result",
+            "actionCode": "START_INSPECTION",
+            "actionName": "开始检验",
+            "status": status,
+            "content": content,
+            "taskList": None,
+        }
+
+    async def finish(delta: dict, extra_action_result: dict | None = None):
+        yield sse_event("answer_delta", delta)
+        if extra_action_result is not None:
+            yield sse_event("action_result", extra_action_result)
+        yield sse_event(
+            "message_end",
+            {
+                "requestId": request_id,
+                "sessionId": session_id,
+                "turnId": turn_id,
+                "userMessageId": user_message_id,
+                "assistantMessageId": user_message_id + 1,
+                "status": "success",
+                "actionCode": "START_INSPECTION",
+            },
+        )
+
+    source = "start_inspection"
+    try:
+        task_list = await fetch_inspection_tasks(req.clientType or "pc", auth)
+    except (httpx.ConnectError, httpx.ConnectTimeout) as e:
+        print(
+            f"[inspection] 后端任务列表接口不可达（{TODO_BACKEND_BASE}），降级为本地数据: {e}",
+            flush=True,
+        )
+        task_list = local_inspection_tasks()
+        source = "local_ships"
+    except Exception as e:
+        print(f"[inspection] 任务列表查询失败: {e}", flush=True)
+        async for chunk in finish(
+            base_delta("failed", "获取任务列表失败，请稍后重试。")
+        ):
+            yield chunk
+        return
+
+    count = len(task_list)
+    content = (
+        f"已为您找到 {count} 项待检验和检验中的任务，请选择要检验的任务。"
+        if count
+        else "当前没有待检验或检验中的任务。"
+    )
+    delta = base_delta("success", content)
+    delta.update(
+        {
+            "taskList": task_list,
+            "refresh": ["inspectionTaskList", "overview"],
+            "source": source,
+        }
+    )
+    async for chunk in finish(
+        delta,
+        {
+            "actionCode": "START_INSPECTION",
+            "status": "success",
+            "message": "查询成功",
+            "payload": {"taskTotal": count, "taskList": task_list},
+        },
+    ):
+        yield chunk
+
+
+@app.post("/api/ai/chat/classify")
+async def chat_classify(request: Request):
+    raw = await request.body()
+    if raw:
+        try:
+            data = json.loads(raw)
+        except Exception as e:
+            print(
+                f"[classify] 请求体不是合法 JSON，按空请求处理: {e} body={raw.decode('utf-8', 'replace')[:2000]}",
+                flush=True,
+            )
+            data = {}
+    else:
+        data = {}
+    if not isinstance(data, dict):
+        data = {}
+    req = ClassifyRequest.model_validate(data)
+    auth = request.headers.get("Authorization", "")
+    if detect_begin_task(req):
+        stream = stream_begin_task(req, auth)
+    elif detect_complete_inspection(req):
+        stream = stream_complete_inspection(req, auth)
+    elif detect_view_check_items_overview(req):
+        stream = stream_view_check_items_overview(req, auth)
+    elif detect_record_issue(req):
+        stream = stream_record_issue(req, auth)
+    elif detect_confirm_rectification(req):
+        stream = stream_confirm_rectification(req, auth)
+    elif detect_pending_rectification(req):
+        stream = stream_pending_rectification(req, auth)
+    elif detect_start_inspection(req):
+        stream = stream_start_inspection(req, auth)
+    elif detect_generate_work_log(req):
+        stream = stream_generate_work_log(req, auth)
+    elif detect_upload_material(req):
+        stream = stream_upload_material(req, auth)
+    elif detect_generate_ra_report(req):
+        stream = stream_generate_ra_report(req, auth)
+    elif detect_generate_preparation_form(req):
+        stream = stream_generate_preparation_form(req, auth)
+    elif detect_save_check_items(req):
+        stream = stream_save_check_items(req, auth)
+    elif detect_delete_check_item(req):
+        stream = stream_delete_check_item(req, auth)
+    elif detect_add_check_item(req):
+        stream = stream_add_check_item(req, auth)
+    else:
+        stream = stream_classify(req, auth)
+    return StreamingResponse(
+        stream,
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+@app.post("/api/ai/chat/stop")
+async def chat_stop():
+    return {"status": "stopped"}
 
 
 # ==================== 页面数据接口：任务概览 / 检验项写回 ====================
@@ -408,6 +3391,11 @@ async def overview():
         else:
             counts["已完成"] += 1
     return counts
+
+
+@app.get("/api/ships")
+async def list_ships():
+    return SHIPS
 
 
 @app.post("/api/ships/{ship_name}/items")
@@ -455,6 +3443,7 @@ def save_conversations(convs: list[dict]) -> None:
 class SaveConversationRequest(BaseModel):
     messages: list[Message]
     title: str = ""
+    conv_id: str = ""
 
 
 @app.get("/api/conversations")
@@ -487,17 +3476,27 @@ async def save_conversation(req: SaveConversationRequest):
         first_user = next((m.content for m in req.messages if m.role == "user"), "新对话")
         if first_user.startswith("开始新的检验工作会话"):
             first_user = "检验工作会话"
+        first_user = re.sub(r"^【[^】]*】\s*", "", first_user) or "新对话"
         title = first_user.replace("\n", " ")[:24]
-    conv = {
-        "id": uuid.uuid4().hex,
-        "title": title,
-        "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "messages": json.dumps(
-            [{"role": m.role, "content": m.content} for m in req.messages],
-            ensure_ascii=False,
-        ),
-    }
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    messages_json = json.dumps(
+        [{"role": m.role, "content": m.content} for m in req.messages],
+        ensure_ascii=False,
+    )
     convs = load_conversations()
+    if req.conv_id:
+        for c in convs:
+            if c["id"] == req.conv_id:
+                c["messages"] = messages_json
+                c["time"] = now
+                save_conversations(convs)
+                return {"saved": True, "id": c["id"], "title": c["title"], "time": now}
+    conv = {
+        "id": req.conv_id or uuid.uuid4().hex,
+        "title": title,
+        "time": now,
+        "messages": messages_json,
+    }
     convs.append(conv)
     save_conversations(convs)
     return {"saved": True, "id": conv["id"], "title": conv["title"], "time": conv["time"]}
@@ -511,14 +3510,14 @@ async def save_conversation(req: SaveConversationRequest):
 async def ship_page(_path: str = ""):
     html_path = os.path.join(os.path.dirname(__file__), "static", "ship-inspection.html")
     with open(html_path, encoding="utf-8") as f:
-        return f.read()
+        return HTMLResponse(f.read(), headers={"Cache-Control": "no-cache"})
 
 
 @app.get("/", response_class=HTMLResponse)
 async def index():
     html_path = os.path.join(os.path.dirname(__file__), "static", "index.html")
     with open(html_path, encoding="utf-8") as f:
-        return f.read()
+        return HTMLResponse(f.read(), headers={"Cache-Control": "no-cache"})
 
 
 if __name__ == "__main__":
