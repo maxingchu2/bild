@@ -13,6 +13,7 @@
 前端 static/index.html 零改动；智能体切换与工具执行过程实时显示在思考区。
 """
 
+import asyncio
 import csv
 import json
 import os
@@ -2685,6 +2686,104 @@ async def stream_record_issue(
         yield chunk
 
 
+# ==================== 船只任务准备（BEGIN_TASK） ====================
+
+BEGIN_TASK_PATTERN = re.compile(r"开始准备\s*(.*?)\s*(?:的)?船只(?:的)?任务")
+
+
+def detect_begin_task(req: ClassifyRequest) -> bool:
+    if req.actionCode == "BEGIN_TASK":
+        return True
+    if req.actionCode:
+        return False
+    return bool(BEGIN_TASK_PATTERN.search(req.content or ""))
+
+
+def parse_ship_name(content: str, params: dict) -> str:
+    name = str(params.get("shipName") or "").strip()
+    if name:
+        return name
+    m = BEGIN_TASK_PATTERN.search(content or "")
+    if m:
+        return m.group(1).strip()
+    return ""
+
+
+async def stream_begin_task(
+    req: ClassifyRequest, auth: str
+) -> AsyncGenerator[str, None]:
+    request_id = str(uuid.uuid4())
+    session_id = req.sessionId or int(datetime.now().timestamp() * 1000)
+    if isinstance(session_id, str) and session_id.isdigit():
+        session_id = int(session_id)
+    turn_id = int(datetime.now().timestamp() * 1000) + 1
+    user_message_id = turn_id + 1
+
+    task_id = req.taskId
+    if isinstance(task_id, str) and task_id.isdigit():
+        task_id = int(task_id)
+
+    yield sse_event(
+        "message_start",
+        {
+            "requestId": request_id,
+            "sessionId": session_id,
+            "turnId": turn_id,
+            "userMessageId": user_message_id,
+            "assistantMessageId": None,
+            "status": "running",
+        },
+    )
+
+    ship_name = parse_ship_name(req.content or "", req.actionParams or {})
+
+    yield sse_event(
+        "answer_delta",
+        {
+            "seq": 1,
+            "type": "action_result",
+            "actionCode": "BEGIN_TASK",
+            "actionName": "船只任务准备",
+            "status": "success",
+            "content": "",
+            "taskId": task_id,
+            "shipName": ship_name or None,
+        },
+    )
+
+    if ship_name:
+        chunks = [
+            "好的，",
+            f"已为您启动「{ship_name}」船只的准备任务。",
+            "正在加载作业清单、检查设备状态与排期…",
+            "准备完成后将自动通知您。",
+        ]
+    else:
+        chunks = [
+            "已收到开始准备船只任务的指令，",
+            "但未识别到船只名称或编号，",
+            "请告诉我需要准备哪一艘船只的任务（如：开始准备东海01船只任务）。",
+        ]
+    for chunk in chunks:
+        yield sse_event("answer_delta", {"content": chunk})
+        await asyncio.sleep(0.05)
+
+    yield sse_event("answer_delta", {"content": "[DONE]"})
+
+    yield sse_event(
+        "message_end",
+        {
+            "requestId": request_id,
+            "sessionId": session_id,
+            "turnId": turn_id,
+            "userMessageId": user_message_id,
+            "assistantMessageId": user_message_id + 1,
+            "status": "success",
+            "actionCode": "BEGIN_TASK",
+        },
+    )
+
+
 # ==================== 确认整改遗留问题（CONFIRM_RECTIFICATION_ISSUES） ====================
 
 CONFIRM_RECTIFICATION_PATTERN = re.compile(
@@ -3220,7 +3319,9 @@ async def chat_classify(request: Request):
         data = {}
     req = ClassifyRequest.model_validate(data)
     auth = request.headers.get("Authorization", "")
-    if detect_complete_inspection(req):
+    if detect_begin_task(req):
+        stream = stream_begin_task(req, auth)
+    elif detect_complete_inspection(req):
         stream = stream_complete_inspection(req, auth)
     elif detect_view_check_items_overview(req):
         stream = stream_view_check_items_overview(req, auth)
