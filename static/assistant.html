@@ -3,53 +3,67 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>船检智能体 Harness 控制台</title>
+<title>船检智能体 Harness · LangGraph 控制台</title>
 <style>
-:root{--primary:#2563eb;--bg:#f1f5f9;--card:#fff;--border:#e2e8f0;--text:#1e293b;--muted:#64748b;--ok:#16a34a;--warn:#d97706;--bad:#dc2626}
+:root{--primary:#2563eb;--bg:#0f172a;--panel:#1e293b;--card:#fff;--border:#e2e8f0;--text:#1e293b;--muted:#64748b;--ok:#16a34a;--warn:#d97706;--bad:#dc2626}
 *{box-sizing:border-box;margin:0;padding:0}
-body{font-family:"PingFang SC","Microsoft YaHei",sans-serif;background:var(--bg);color:var(--text);height:100vh;display:flex;flex-direction:column}
-header{background:#0f172a;color:#fff;padding:12px 20px;display:flex;align-items:center;gap:12px}
+body{font-family:"PingFang SC","Microsoft YaHei",sans-serif;background:#f1f5f9;color:var(--text);height:100vh;display:flex;flex-direction:column}
+header{background:var(--bg);color:#fff;padding:10px 20px;display:flex;align-items:center;gap:12px;flex-wrap:wrap}
 header h1{font-size:16px;font-weight:600}
 header .tag{font-size:12px;background:#1e40af;border-radius:10px;padding:2px 10px}
-main{flex:1;display:grid;grid-template-columns:1fr 360px;gap:14px;padding:14px;overflow:hidden}
+#cards{display:grid;grid-template-columns:repeat(6,1fr);gap:10px;padding:12px 14px 0}
+.card{background:var(--card);border:1px solid var(--border);border-radius:10px;padding:10px 14px}
+.card .v{font-size:22px;font-weight:700;color:var(--primary)}
+.card .l{font-size:12px;color:var(--muted)}
+main{flex:1;display:grid;grid-template-columns:1fr 480px;gap:14px;padding:12px 14px;overflow:hidden}
 .panel{background:var(--card);border:1px solid var(--border);border-radius:10px;display:flex;flex-direction:column;overflow:hidden}
-.panel h2{font-size:13px;color:var(--muted);padding:10px 14px;border-bottom:1px solid var(--border);display:flex;justify-content:space-between;align-items:center}
+.panel h2,.side h3{font-size:13px;color:var(--muted);padding:9px 13px;border-bottom:1px solid var(--border);display:flex;justify-content:space-between;align-items:center}
 #chat{flex:1;overflow-y:auto;padding:14px;display:flex;flex-direction:column;gap:10px}
-.msg{max-width:78%;padding:9px 13px;border-radius:10px;font-size:14px;line-height:1.6;white-space:pre-wrap}
+.msg{max-width:80%;padding:9px 13px;border-radius:10px;font-size:14px;line-height:1.6;white-space:pre-wrap}
 .msg.user{align-self:flex-end;background:var(--primary);color:#fff}
 .msg.bot{align-self:flex-start;background:#f1f5f9;border:1px solid var(--border)}
 .msg .code{display:inline-block;font-size:11px;background:#dbeafe;color:#1d4ed8;border-radius:6px;padding:1px 8px;margin-bottom:5px}
-.msg .fb{margin-top:6px;display:flex;gap:6px;align-items:center}
+.msg .rulehit{display:inline-block;font-size:11px;background:#dcfce7;color:#15803d;border-radius:6px;padding:1px 8px;margin:0 0 5px 5px}
+.msg .fb{margin-top:6px;display:flex;gap:6px;align-items:center;flex-wrap:wrap}
 .msg .fb button{font-size:11px;border:1px solid var(--border);background:#fff;border-radius:6px;padding:2px 8px;cursor:pointer}
 .msg .fb select{font-size:11px;padding:2px}
+#recBar{display:flex;gap:6px;padding:8px 14px;border-top:1px solid var(--border);flex-wrap:wrap}
+#recBar button{font-size:12px;border:1px solid #bfdbfe;background:#eff6ff;color:#1d4ed8;border-radius:14px;padding:4px 12px;cursor:pointer}
+#recBar button:hover{background:#dbeafe}
 #inputBar{display:flex;gap:8px;padding:10px 14px;border-top:1px solid var(--border)}
 #inputBar input{flex:1;border:1px solid var(--border);border-radius:8px;padding:9px 12px;font-size:14px;outline:none}
 #inputBar button{background:var(--primary);color:#fff;border:0;border-radius:8px;padding:0 18px;font-size:14px;cursor:pointer}
-aside{display:flex;flex-direction:column;gap:14px;overflow-y:auto}
-.side{background:var(--card);border:1px solid var(--border);border-radius:10px}
-.side h3{font-size:13px;color:var(--muted);padding:9px 12px;border-bottom:1px solid var(--border);display:flex;justify-content:space-between;align-items:center}
-.side .body{padding:10px 12px;font-size:13px}
-.rec{display:block;width:100%;text-align:left;border:1px solid var(--border);background:#f8fafc;border-radius:8px;padding:7px 10px;margin-bottom:6px;cursor:pointer;font-size:13px}
-.rec:hover{border-color:var(--primary);background:#eff6ff}
-.rec small{display:block;color:var(--muted);font-size:11px}
-.metric{display:flex;justify-content:space-between;padding:3px 0;font-size:13px}
-.metric b{color:var(--primary)}
-.rule{font-size:12px;border-left:3px solid var(--ok);background:#f0fdf4;padding:5px 8px;border-radius:0 6px 6px 0;margin-bottom:5px}
-.opt{font-size:12px;color:var(--muted);margin-bottom:4px}
-button.small{font-size:12px;border:1px solid var(--border);background:#fff;border-radius:6px;padding:2px 10px;cursor:pointer}
+aside{display:flex;flex-direction:column;gap:12px;overflow-y:auto}
+.side{background:var(--card);border:1px solid var(--border);border-radius:10px;flex-shrink:0}
+.side .body{padding:10px 13px;font-size:13px}
 .empty{color:var(--muted);font-size:12px}
+.rule{font-size:12px;border-left:3px solid var(--ok);background:#f0fdf4;padding:5px 8px;border-radius:0 6px 6px 0;margin-bottom:5px}
+button.small{font-size:12px;border:1px solid var(--border);background:#fff;border-radius:6px;padding:2px 10px;cursor:pointer}
+svg text{font-family:inherit}
+#pipeline{display:flex;align-items:center;gap:4px;padding:4px 0 8px;flex-wrap:wrap}
+.pnode{background:#eff6ff;border:1px solid #bfdbfe;color:#1d4ed8;border-radius:8px;padding:5px 10px;font-size:12px;text-align:center}
+.pnode.done{background:#f0fdf4;border-color:#86efac;color:#15803d}
+.arrow{color:#94a3b8;font-size:14px}
+.pnote{font-size:11px;color:var(--muted);margin-top:2px}
+.srcbar{height:14px;border-radius:7px;overflow:hidden;display:flex;margin:6px 0}
+.legend{font-size:11px;color:var(--muted);display:flex;gap:12px;flex-wrap:wrap}
+.dot{display:inline-block;width:8px;height:8px;border-radius:4px;margin-right:4px}
 </style>
 </head>
 <body>
 <header>
   <h1>船检智能体 Harness 控制台</h1>
-  <span class="tag">LangGraph 观测→推荐→优化</span>
+  <span class="tag">LangGraph: observe → recommend → optimize → apply</span>
   <span class="tag" id="mainBase"></span>
+  <span style="flex:1"></span>
+  <button class="small" onclick="optimize()" style="background:#1e40af;color:#fff;border:0">运行优化管线</button>
 </header>
+<div id="cards"></div>
 <main>
   <section class="panel">
-    <h2>对话（经 Harness 代理转发主服务）</h2>
+    <h2>对话（经 Harness 代理 → 主服务 /api/ai/chat/classify）</h2>
     <div id="chat"></div>
+    <div id="recBar"></div>
     <div id="inputBar">
       <input id="input" placeholder="例如：开始准备东海01船只任务 / 发现船体外板存在裂纹，严重程度高" onkeydown="if(event.key==='Enter')send()">
       <button onclick="send()">发送</button>
@@ -57,40 +71,45 @@ button.small{font-size:12px;border:1px solid var(--border);background:#fff;borde
   </section>
   <aside>
     <div class="side">
-      <h3>推荐下一步动作 <button class="small" onclick="optimize()">运行优化管线</button></h3>
-      <div class="body" id="recs"><span class="empty">暂无推荐，先发起对话或点击「运行优化管线」</span></div>
+      <h3>交互趋势（分钟级，总量/成功/规则命中）</h3>
+      <div class="body" id="timeline"><span class="empty">暂无数据</span></div>
     </div>
     <div class="side">
-      <h3>运行指标（observe）</h3>
-      <div class="body" id="metrics"><span class="empty">暂无数据</span></div>
+      <h3>动作分布</h3>
+      <div class="body" id="dist"><span class="empty">暂无数据</span></div>
     </div>
     <div class="side">
-      <h3>动态覆盖规则（optimize 自动生成）</h3>
-      <div class="body" id="rules"><span class="empty">暂无规则；对回答点「不对」并选期望动作，会自动生成规则</span></div>
+      <h3>推荐模块分析</h3>
+      <div class="body" id="recAnalysis"><span class="empty">暂无数据</span></div>
     </div>
     <div class="side">
-      <h3>优化记录</h3>
-      <div class="body" id="opts"><span class="empty">暂无</span></div>
+      <h3>LangGraph 管线（最近一次运行）</h3>
+      <div class="body" id="pipelineBody"><span class="empty">尚未运行</span></div>
+    </div>
+    <div class="side">
+      <h3>动态覆盖规则（自动优化生成）</h3>
+      <div class="body" id="rules"><span class="empty">暂无规则；对回答点「不对」并选期望动作，会自动生成</span></div>
     </div>
   </aside>
 </main>
 <script>
 const ACTIONS = {"BEGIN_TASK":"船只任务准备","START_INSPECTION":"开始检验","ADD_CHECK_ITEM":"新增检查项","DELETE_CHECK_ITEM":"删除检查项","SAVE_CHECK_ITEMS":"保存检查项","VIEW_CHECK_ITEMS_OVERVIEW":"查看检查项概览","GENERATE_PREPARATION_FORM":"生成开检准备单","GENERATE_RA_REPORT":"生成RA报告","OPEN_UPLOAD_MATERIAL":"上传资料","GENERATE_WORK_LOG":"生成工作日志","RECORD_ISSUE":"问题记录","CONFIRM_RECTIFICATION_ISSUES":"确认整改遗留问题","PENDING_RECTIFICATION_ISSUES":"未整改遗留问题","COMPLETE_INSPECTION_TASK":"完成检验任务"};
+const COLORS=["#2563eb","#16a34a","#d97706","#dc2626","#7c3aed","#0891b2","#db2777","#65a30d","#f59e0b","#475569"];
 const chat = document.getElementById('chat');
 const TASK_ID = 10001;
-
 function el(html){const d=document.createElement('div');d.innerHTML=html;return d.firstElementChild;}
 function scroll(){chat.scrollTop=chat.scrollHeight;}
+function esc(s){return String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
 
-async function send(text){
+async function send(text,fromRec){
   const input=document.getElementById('input');
   const content=(text||input.value).trim();
   if(!content)return;
   input.value='';
   chat.appendChild(el(`<div class="msg user">${esc(content)}</div>`));
-  const bot=el(`<div class="msg bot"><span class="code" style="display:none"></span><span class="txt"></span></div>`);
+  const bot=el(`<div class="msg bot"><span class="code" style="display:none"></span><span class="rulehit" style="display:none"></span><span class="txt"></span></div>`);
   chat.appendChild(bot);scroll();
-  const resp=await fetch('/api/harness/chat',{method:'POST',headers:{'Content-Type':'application/json','Accept':'text/event-stream'},body:JSON.stringify({taskId:TASK_ID,clientType:'pc',pageCode:'preparation',sessionType:'operation',content,actionParams:{}})});
+  const resp=await fetch('/api/harness/chat',{method:'POST',headers:{'Content-Type':'application/json','Accept':'text/event-stream'},body:JSON.stringify({taskId:TASK_ID,clientType:'pc',pageCode:'preparation',sessionType:'operation',content,actionParams:{},fromRecommendation:!!fromRec})});
   const reader=resp.body.getReader();const dec=new TextDecoder();let buf='';let meta={};
   while(true){
     const {done,value}=await reader.read();if(done)break;
@@ -105,20 +124,22 @@ async function send(text){
       }
       if(!data)continue;
       let obj;try{obj=JSON.parse(data);}catch(e){continue;}
-      if(ev==='harness_meta'){meta=obj;continue;}
+      if(ev==='harness_meta'){meta=obj;
+        if(obj.overrideRule){const r=bot.querySelector('.rulehit');r.style.display='inline-block';r.textContent='规则命中: '+obj.overrideRule;}
+        continue;}
       if(obj.actionCode&&!meta.actionCode){meta.actionCode=obj.actionCode;}
       if(obj.actionCode){const c=bot.querySelector('.code');c.style.display='inline-block';c.textContent=obj.actionCode+(ACTIONS[obj.actionCode]?' · '+ACTIONS[obj.actionCode]:'');}
       if(typeof obj.content==='string'&&obj.content&&obj.content!=='[DONE]'){bot.querySelector('.txt').textContent+=obj.content;scroll();}
     }
   }
   addFeedback(bot,content,meta);
-  refresh();
+  await optimize(); // 每轮交互后自动跑一遍管线，指标与推荐实时更新
 }
 
 function addFeedback(bot,content,meta){
   const fb=el(`<div class="fb"><span style="font-size:11px;color:#64748b">识别对吗？</span><button>对</button><button>不对</button><select style="display:none"><option value="">选择期望动作…</option>${Object.entries(ACTIONS).map(([k,v])=>`<option value="${k}">${v}</option>`).join('')}</select></div>`);
   const [ok,bad]=fb.querySelectorAll('button');const sel=fb.querySelector('select');
-  ok.onclick=async()=>{await postFB('up');fb.innerHTML='<span style="font-size:11px;color:#16a34a">已反馈 ✓</span>';};
+  ok.onclick=async()=>{await postFB('up');fb.innerHTML='<span style="font-size:11px;color:#16a34a">已反馈 ✓</span>';refresh();};
   bad.onclick=()=>{sel.style.display='inline-block';};
   sel.onchange=async()=>{if(!sel.value)return;await postFB('down',sel.value);fb.innerHTML='<span style="font-size:11px;color:#d97706">已反馈，自动优化已触发</span>';refresh();};
   async function postFB(rating,expected){
@@ -129,27 +150,69 @@ function addFeedback(bot,content,meta){
 
 async function optimize(){
   await fetch('/api/harness/optimize',{method:'POST'});
-  refresh();
+  await refresh();
+}
+
+function lineChart(timeline){
+  if(!timeline.length)return '<span class="empty">暂无数据</span>';
+  const W=440,H=120,P=24;
+  const max=Math.max(...timeline.map(t=>t.total),1);
+  const x=i=>P+i*(W-2*P)/Math.max(timeline.length-1,1);
+  const y=v=>H-P/2-v*(H-P-10)/max;
+  const path=k=>timeline.map((t,i)=>`${i?'L':'M'}${x(i).toFixed(1)},${y(t[k]).toFixed(1)}`).join(' ');
+  const labels=timeline.map((t,i)=>i%Math.ceil(timeline.length/5)===0?`<text x="${x(i)}" y="${H-2}" font-size="9" fill="#94a3b8" text-anchor="middle">${t.time}</text>`:'').join('');
+  return `<svg width="${W}" height="${H}" viewBox="0 0 ${W} ${H}">
+    <path d="${path('total')}" fill="none" stroke="#2563eb" stroke-width="2"/>
+    <path d="${path('success')}" fill="none" stroke="#16a34a" stroke-width="2" stroke-dasharray="4 3"/>
+    <path d="${path('override')}" fill="none" stroke="#d97706" stroke-width="2" stroke-dasharray="2 3"/>
+    ${labels}</svg>
+    <div class="legend"><span><span class="dot" style="background:#2563eb"></span>总交互</span><span><span class="dot" style="background:#16a34a"></span>成功</span><span><span class="dot" style="background:#d97706"></span>规则命中</span></div>`;
+}
+
+function barChart(dist){
+  if(!dist.length)return '<span class="empty">暂无数据</span>';
+  const max=Math.max(...dist.map(d=>d[1]),1);
+  return dist.slice(0,10).map(([k,v],i)=>`
+    <div style="display:flex;align-items:center;gap:8px;margin:4px 0;font-size:12px">
+      <span style="width:130px;color:#475569;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${ACTIONS[k]||k}</span>
+      <div style="flex:1;background:#f1f5f9;border-radius:5px"><div style="width:${(v/max*100).toFixed(0)}%;background:${COLORS[i%COLORS.length]};height:12px;border-radius:5px"></div></div>
+      <b style="width:24px;text-align:right">${v}</b></div>`).join('');
 }
 
 async function refresh(){
-  const st=await (await fetch('/api/harness/state')).json();
+  const [st,an]=await Promise.all([
+    (await fetch('/api/harness/state')).json(),
+    (await fetch('/api/harness/analytics')).json()]);
   document.getElementById('mainBase').textContent='主服务 '+st.mainBase;
-  const recs=document.getElementById('recs');
-  recs.innerHTML=(st.recommendations||[]).map(r=>`<button class="rec" onclick="send('${esc(r.sampleContent)}')"><b>${r.actionName}</b>（${r.actionCode}）<small>${r.reason} · 点击试发：${esc(r.sampleContent)}</small></button>`).join('')||'<span class="empty">暂无推荐</span>';
   const m=st.metrics||{};
-  document.getElementById('metrics').innerHTML=Object.keys(m).length?`
-    <div class="metric"><span>总交互数</span><b>${m.totalInteractions??'-'}</b></div>
-    <div class="metric"><span>成功率</span><b>${m.successRate!=null?(m.successRate*100).toFixed(1)+'%':'-'}</b></div>
-    <div class="metric"><span>未识别次数</span><b>${m.unmatchedCount??'-'}</b></div>
-    <div class="metric"><span>负反馈数</span><b>${m.negativeFeedback??'-'}</b></div>
-    <div class="metric"><span>动作分布</span><b style="font-size:11px">${Object.entries(m.actionCounts||{}).map(([k,v])=>k+':'+v).join(' ')||'-'}</b></div>`:'<span class="empty">暂无数据</span>';
+  document.getElementById('cards').innerHTML=[
+    ['总交互数',m.totalInteractions??0],
+    ['成功率',m.successRate!=null?(m.successRate*100).toFixed(1)+'%':'-'],
+    ['未识别',m.unmatchedCount??0],
+    ['负反馈',an.feedbackCount??0],
+    ['覆盖规则',an.ruleCount??0],
+    ['推荐采纳率',an.recStats&&an.recStats.adoptionRate!=null?(an.recStats.adoptionRate*100).toFixed(1)+'%':'-'],
+  ].map(([l,v])=>`<div class="card"><div class="v">${v}</div><div class="l">${l}</div></div>`).join('');
+  document.getElementById('timeline').innerHTML=lineChart(an.timeline||[]);
+  document.getElementById('dist').innerHTML=barChart(an.actionDistribution||[]);
+  const rs=an.recStats||{};
+  const srcEntries=Object.entries(rs.bySource||{});
+  const srcTotal=srcEntries.reduce((a,[,v])=>a+v,0)||1;
+  document.getElementById('recAnalysis').innerHTML=`
+    <div style="font-size:12px;color:#475569">推荐展示 <b>${rs.shown||0}</b> 次 · 采纳 <b>${rs.adopted||0}</b> 次 · 采纳率 <b>${rs.adoptionRate!=null?(rs.adoptionRate*100).toFixed(1)+'%':'-'}</b></div>
+    <div class="srcbar">${srcEntries.map(([k,v],i)=>`<div style="width:${(v/srcTotal*100).toFixed(1)}%;background:${COLORS[i%COLORS.length]}"></div>`).join('')||'<div style="width:100%;background:#f1f5f9"></div>'}</div>
+    <div class="legend">${srcEntries.map(([k,v],i)=>`<span><span class="dot" style="background:${COLORS[i%COLORS.length]}"></span>${k} ${v}</span>`).join('')||'<span class="empty">暂无来源数据</span>'}</div>`;
+  const run=(an.pipelineRuns||[]).slice(-1)[0];
+  document.getElementById('pipelineBody').innerHTML=run?`
+    <div id="pipeline">${['observe','recommend','optimize','apply'].map((n,i)=>`<div class="pnode done">${n}</div>${i<3?'<span class="arrow">→</span>':''}`).join('')}</div>
+    ${(run.notes||[]).map(n=>`<div class="pnote">· ${esc(n)}</div>`).join('')}
+    <div class="pnote" style="margin-top:4px">最近运行 ${run.at?.slice(0,19)} · 推荐 ${run.recommendations} 条 · 新规则 ${run.newRules} 条（共 ${an.pipelineRuns.length} 次记录）</div>`
+    :'<span class="empty">尚未运行</span>';
   document.getElementById('rules').innerHTML=(st.overrideRules||[]).map(r=>`<div class="rule">「${esc(r.keyword)}」→ ${r.actionCode}<br><small style="color:#64748b">${r.source} · ${r.createdAt?.slice(0,19)}</small></div>`).join('')||'<span class="empty">暂无规则</span>';
-  document.getElementById('opts').innerHTML=(st.optimizations||[]).map(o=>`<div class="opt">${o.at?.slice(0,19)} 新增 ${o.newRules.length} 条规则</div>`).join('')||'<span class="empty">暂无</span>';
+  document.getElementById('recBar').innerHTML=(st.recommendations||[]).map(r=>`<button title="${r.reason}" onclick="send('${esc(r.sampleContent)}',true)">▶ ${r.actionName}</button>`).join('')||'<span class="empty" style="align-self:center">发起对话后这里会出现推荐动作</span>';
 }
-
-function esc(s){return String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
 refresh();
+setInterval(refresh,15000);
 </script>
 </body>
 </html>

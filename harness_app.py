@@ -98,6 +98,8 @@ def default_state() -> Dict[str, Any]:
         "recommendations": [],    # recommend 输出
         "optimizations": [],      # optimize 历史
         "last_optimized_at": None,
+        "pipeline_runs": [],     # 管线运行历史
+        "rec_stats": {"shown": 0, "adopted": 0, "bySource": {}},  # 推荐展示/采纳统计
     }
 
 
@@ -279,6 +281,20 @@ def run_pipeline() -> Dict[str, Any]:
         "override_rules": HARNESS_STATE["override_rules"],
         "notes": [],
     })
+    recs = result.get("recommendations", [])
+    stats = HARNESS_STATE.setdefault("rec_stats", {"shown": 0, "adopted": 0, "bySource": {}})
+    stats["shown"] += len(recs)
+    for r in recs:
+        src = r.get("reason", "其他")
+        stats["bySource"][src] = stats["bySource"].get(src, 0) + 1
+    HARNESS_STATE.setdefault("pipeline_runs", []).append({
+        "at": datetime.now().isoformat(),
+        "notes": result.get("notes", []),
+        "newRules": len(result.get("new_rules", [])),
+        "recommendations": len(recs),
+    })
+    HARNESS_STATE["pipeline_runs"] = HARNESS_STATE["pipeline_runs"][-50:]
+    save_state()
     return {
         "metrics": result.get("metrics", {}),
         "recommendations": result.get("recommendations", []),
@@ -310,6 +326,46 @@ async def harness_state():
         "optimizations": HARNESS_STATE["optimizations"][-10:],
         "lastOptimizedAt": HARNESS_STATE["last_optimized_at"],
         "recentInteractions": HARNESS_STATE["interactions"][-20:],
+    })
+
+
+@app.get("/api/harness/analytics")
+async def harness_analytics():
+    """数据分析大盘：时序趋势、动作分布、推荐分析、管线运行历史"""
+    interactions = HARNESS_STATE["interactions"]
+    buckets: Dict[str, Dict[str, int]] = {}
+    for it in interactions:
+        key = (it.get("at") or "")[:16]  # 分钟级
+        b = buckets.setdefault(key, {"total": 0, "success": 0, "override": 0})
+        b["total"] += 1
+        if it.get("status") == "success":
+            b["success"] += 1
+        if it.get("overrideRule"):
+            b["override"] += 1
+    timeline = [
+        {"time": k[11:], "total": v["total"], "success": v["success"], "override": v["override"]}
+        for k, v in sorted(buckets.items())
+    ][-30:]
+    action_dist: Dict[str, int] = {}
+    status_dist: Dict[str, int] = {}
+    for it in interactions:
+        action_dist[it.get("actionCode") or "UNMATCHED"] = action_dist.get(it.get("actionCode") or "UNMATCHED", 0) + 1
+        status_dist[it.get("status") or "unknown"] = status_dist.get(it.get("status") or "unknown", 0) + 1
+    stats = HARNESS_STATE.get("rec_stats", {})
+    shown = stats.get("shown", 0)
+    return JSONResponse({
+        "timeline": timeline,
+        "actionDistribution": sorted(action_dist.items(), key=lambda x: -x[1]),
+        "statusDistribution": status_dist,
+        "recStats": {
+            "shown": shown,
+            "adopted": stats.get("adopted", 0),
+            "adoptionRate": round(stats.get("adopted", 0) / shown, 3) if shown else None,
+            "bySource": stats.get("bySource", {}),
+        },
+        "pipelineRuns": HARNESS_STATE.get("pipeline_runs", [])[-10:],
+        "ruleCount": len(HARNESS_STATE["override_rules"]),
+        "feedbackCount": len(HARNESS_STATE["feedback"]),
     })
 
 
@@ -364,6 +420,13 @@ async def harness_chat(request: Request):
     applied = apply_override_rules(payload)
     rule_hit = applied.pop("_harnessRule", None)
     auth = request.headers.get("Authorization", "")
+    content_in = payload.get("content", "") or ""
+    if payload.get("fromRecommendation") or any(
+        r.get("sampleContent") == content_in
+        for r in HARNESS_STATE.get("recommendations", [])
+    ):
+        stats = HARNESS_STATE.setdefault("rec_stats", {"shown": 0, "adopted": 0, "bySource": {}})
+        stats["adopted"] += 1
     interaction = {
         "id": str(uuid.uuid4()),
         "at": datetime.now().isoformat(),
