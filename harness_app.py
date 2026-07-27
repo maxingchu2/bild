@@ -29,6 +29,7 @@ import httpx
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi.staticfiles import StaticFiles
 from langgraph.graph import END, START, StateGraph
 
 MAIN_BASE = os.getenv("HARNESS_MAIN_BASE", "http://127.0.0.1:8000")
@@ -311,6 +312,18 @@ app.add_middleware(
 )
 
 
+@app.get("/")
+@app.get("/index.html")
+async def index_page():
+    return FileResponse(os.path.join(STATIC_DIR, "index.html"))
+
+
+@app.get("/ship-inspection")
+@app.get("/ship-inspection.html")
+async def ship_inspection_page():
+    return FileResponse(os.path.join(STATIC_DIR, "ship-inspection.html"))
+
+
 @app.get("/assistant")
 async def assistant_page():
     return FileResponse(os.path.join(STATIC_DIR, "assistant.html"))
@@ -475,6 +488,9 @@ async def harness_chat(request: Request):
             save_state()
 
     return StreamingResponse(relay(), media_type="text/event-stream")
+
+
+app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 
 if __name__ == "__main__":
