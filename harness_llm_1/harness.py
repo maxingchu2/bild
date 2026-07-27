@@ -39,6 +39,7 @@ ASSIST_PATTERNS = [
     (re.compile(r"开始检验|开检$"), "START_INSPECTION"),
     (re.compile(r"发现.{0,20}(问题|缺陷|隐患|裂纹|松动|锈蚀|损坏)"), "RECORD_ISSUE"),
     (re.compile(r"完成.{0,6}检验任务"), "COMPLETE_INSPECTION_TASK"),
+    (re.compile(r"(?:发起|开始|启动)?\s*(.*?)\s*的?年度检验|年检流程"), "ANNUAL_SURVEY"),
     (re.compile(r"(查看|整理|汇总).{0,10}(检查项|概览|问题)"), "VIEW_CHECK_ITEMS_OVERVIEW"),
 ]
 
@@ -116,7 +117,8 @@ def node_assist(state: DecideState) -> DecideState:
             return {"decision": {
                 "actionCode": code,
                 "shipName": (m.group(1).strip()
-                             if code == "BEGIN_TASK" and m.groups() else None),
+                             if code in ("BEGIN_TASK", "ANNUAL_SURVEY")
+                             and m.groups() and m.group(1) else None),
                 "confidence": 0.4,
                 "reason": "规则辅助兜底",
                 "decidedBy": "rule_assist",

@@ -1,0 +1,296 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>船舶年度检验（ship-annual-survey）</title>
+<style>
+  * { box-sizing: border-box; }
+  body { margin: 0; font-family: system-ui, "Segoe UI", "Microsoft YaHei", sans-serif; background: #f5f6f8; color: #111827; }
+  header { padding: 14px 24px; background: #0f2a4a; color: #fff; display: flex; justify-content: space-between; align-items: center; }
+  header h1 { font-size: 17px; margin: 0; }
+  header a { color: #93c5fd; font-size: 13px; text-decoration: none; margin-left: 12px; }
+  main { max-width: 1080px; margin: 0 auto; padding: 20px; }
+  .card { background: #fff; border: 1px solid #e5e7eb; border-radius: 10px; padding: 16px 18px; margin-bottom: 16px; }
+  .card h2 { font-size: 15px; margin: 0 0 10px; }
+  .row { display: flex; gap: 8px; flex-wrap: wrap; }
+  input, select { border: 1px solid #d1d5db; border-radius: 6px; padding: 8px 10px; font-size: 13px; font-family: inherit; }
+  button { background: #2563eb; color: #fff; border: none; border-radius: 6px; padding: 8px 14px; font-size: 13px; cursor: pointer; }
+  button.ghost { background: #fff; color: #2563eb; border: 1px solid #2563eb; }
+  button.warn { background: #d97706; }
+  button:disabled { opacity: .45; cursor: not-allowed; }
+  .stages { display: flex; gap: 6px; flex-wrap: wrap; margin: 10px 0; }
+  .stage { flex: 1; min-width: 130px; border: 1px solid #e5e7eb; border-radius: 8px; padding: 8px 10px; font-size: 12px; background: #f9fafb; }
+  .stage .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: #d1d5db; margin-right: 6px; }
+  .stage.done .dot { background: #16a34a; }
+  .stage.current { border-color: #2563eb; background: #eff6ff; }
+  .stage.current .dot { background: #2563eb; }
+  .stage.awaiting_confirm .dot, .stage.attention .dot { background: #d97706; }
+  .stage.blocked .dot { background: #dc2626; }
+  .badge { display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 11px; background: #e5e7eb; margin-left: 6px; }
+  .badge.completed { background: #dcfce7; color: #166534; }
+  .badge.blocked { background: #fee2e2; color: #991b1b; }
+  pre.output { background: #0f172a; color: #e2e8f0; padding: 10px 12px; border-radius: 8px; font-size: 12px; white-space: pre-wrap; word-break: break-word; max-height: 260px; overflow: auto; }
+  .confirm-item { display: flex; align-items: center; justify-content: space-between; padding: 6px 0; border-bottom: 1px dashed #e5e7eb; font-size: 13px; }
+  .confirm-item:last-child { border-bottom: none; }
+  .ok { color: #16a34a; }
+  .muted { color: #6b7280; font-size: 12px; }
+  table { border-collapse: collapse; width: 100%; font-size: 12px; }
+  th, td { border: 1px solid #e5e7eb; padding: 5px 8px; text-align: left; }
+  th { background: #f9fafb; }
+  #tasksel { min-width: 260px; }
+  .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  @media (max-width: 820px) { .grid2 { grid-template-columns: 1fr; } }
+  .notice { background: #fffbeb; border: 1px solid #fde68a; border-radius: 8px; padding: 8px 12px; font-size: 12px; color: #92400e; margin: 8px 0; }
+</style>
+</head>
+<body>
+<header>
+  <h1>营运船舶年度检验流程（ship-annual-survey v1.0.0）</h1>
+  <nav>
+    <a href="/">对话</a>
+    <a href="/ship-inspection">船检工作台</a>
+    <a href="/assistant">Harness 控制台</a>
+  </nav>
+</header>
+<main>
+  <div class="card">
+    <h2>发起年度检验任务</h2>
+    <div class="row">
+      <input id="ship" placeholder="船名 / IMO / CCSNO（如：远洋之星）">
+      <input id="wo" placeholder="检验工作号（可留空自动生成）">
+      <input id="boarding" type="date" title="计划登轮时间">
+      <input id="surveyor" placeholder="验船师">
+      <input id="branch" placeholder="执行分社">
+      <button id="create">创建任务</button>
+    </div>
+    <div class="row" style="margin-top:10px">
+      <select id="tasksel"></select>
+      <button class="ghost" id="reload">刷新</button>
+    </div>
+  </div>
+
+  <div id="taskview" style="display:none">
+    <div class="card">
+      <h2>任务 <span id="t-title"></span> <span class="badge" id="t-status"></span></h2>
+      <div class="muted" id="t-input"></div>
+      <div class="stages" id="stages"></div>
+      <div class="row">
+        <button id="advance">执行 / 推进下一阶段</button>
+        <span class="muted" id="blocked"></span>
+      </div>
+      <div class="notice">本流程只做编排与成果生成；缺陷定性、证书签发和最终归档决策须由验船师在下方确认点人工确认。</div>
+    </div>
+
+    <div class="grid2">
+      <div class="card">
+        <h2>人工确认点</h2>
+        <div id="confirms"></div>
+      </div>
+      <div class="card">
+        <h2>完成条件</h2>
+        <div id="conditions" class="muted">尚未到归档阶段</div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>登轮检验记录（APP 回传：语音/照片/文字 → 规范问题记录）</h2>
+      <div class="row">
+        <input id="r-item" placeholder="检查项编号" style="width:110px">
+        <input id="r-equip" placeholder="设备/部位">
+        <input id="r-desc" placeholder="问题描述（如：应急消防泵压力不足）" style="flex:1;min-width:220px">
+        <select id="r-qual">
+          <option value="待定性">待定性</option>
+          <option value="缺陷">缺陷</option>
+          <option value="备忘">备忘</option>
+          <option value="观察项">观察项</option>
+        </select>
+        <label class="muted"><input type="checkbox" id="r-evi"> 已附证据</label>
+        <label class="muted"><input type="checkbox" id="r-new"> 新增/变更设备</label>
+        <button id="r-add">提交记录</button>
+      </div>
+      <div id="records" style="margin-top:10px"></div>
+    </div>
+
+    <div class="card">
+      <h2>阶段输出</h2>
+      <div id="outputs"></div>
+    </div>
+  </div>
+</main>
+<script>
+const $ = (id) => document.getElementById(id);
+let META = { stages: [], stageNames: {}, confirmPoints: {} };
+let TASK = null;
+
+async function api(path, opts) {
+  const resp = await fetch(path, opts);
+  const data = await resp.json();
+  if (!resp.ok) throw new Error(data.error || resp.status);
+  return data;
+}
+
+async function loadTasks(selectId) {
+  const data = await api('/api/survey/tasks');
+  META = data;
+  const sel = $('tasksel');
+  sel.innerHTML = '<option value="">— 选择已有任务 —</option>';
+  for (const t of data.tasks.slice().reverse()) {
+    const opt = document.createElement('option');
+    opt.value = t.id;
+    opt.textContent = `${t.input.ship_identifier}｜${t.input.inspection_work_order}｜${t.task_status}`;
+    sel.appendChild(opt);
+  }
+  if (selectId) { sel.value = selectId; await openTask(selectId); }
+}
+
+async function openTask(id) {
+  if (!id) { $('taskview').style.display = 'none'; return; }
+  const data = await api(`/api/survey/tasks/${id}`);
+  render(data.task);
+}
+
+function render(task) {
+  TASK = task;
+  $('taskview').style.display = '';
+  $('t-title').textContent = `${task.input.ship_identifier}（${task.input.inspection_work_order}）`;
+  const st = $('t-status');
+  st.textContent = task.task_status === 'completed' ? 'completed' : '进行中';
+  st.className = 'badge ' + (task.task_status === 'completed' ? 'completed' : '');
+  $('t-input').textContent = `证书范围：${task.input.certificate_scope}｜计划登轮：${task.input.planned_boarding_time || '待定'}｜验船师：${task.input.surveyor || '-'}｜分社：${task.input.branch || '-'}`;
+
+  const stagesEl = $('stages');
+  stagesEl.innerHTML = '';
+  for (const s of META.stages) {
+    const div = document.createElement('div');
+    const status = task.stage_status[s];
+    div.className = 'stage ' + status + (task.current_stage === s ? ' current' : '');
+    div.innerHTML = `<span class="dot"></span>${META.stageNames[s]}<br><span class="muted">${statusText(status)}</span>`;
+    stagesEl.appendChild(div);
+  }
+  $('blocked').textContent = '';
+
+  const confEl = $('confirms');
+  confEl.innerHTML = '';
+  for (const [key, c] of Object.entries(task.confirmations)) {
+    const div = document.createElement('div');
+    div.className = 'confirm-item';
+    div.innerHTML = `<span>${c.name} ${c.confirmed ? '<span class="ok">✓ 已确认</span>' : ''}</span>`;
+    if (!c.confirmed) {
+      const btn = document.createElement('button');
+      btn.className = 'ghost';
+      btn.textContent = '确认';
+      btn.onclick = () => confirmPoint(key);
+      div.appendChild(btn);
+    }
+    confEl.appendChild(div);
+  }
+
+  const condEl = $('conditions');
+  if (task.completion_conditions) {
+    condEl.innerHTML = Object.entries(task.completion_conditions)
+      .map(([k, v]) => `<div class="confirm-item"><span>${k}</span><span class="${v ? 'ok' : ''}">${v ? '✓ 满足' : '✗ 未满足'}</span></div>`)
+      .join('');
+  } else {
+    condEl.textContent = '尚未到归档阶段';
+  }
+
+  const recs = task.outputs.onboard_inspection_records || [];
+  $('records').innerHTML = recs.length ? tableOf(recs.map(r => ({
+    编号: r.id, 检查项: r.itemNo || '-', 设备: r.equipment || '-', 描述: r.description,
+    定性: r.qualification, 法规依据: r.regulationRef || '待补',
+    证据: (r.evidence && r.evidence.length) ? '已附' : (r.evidenceStatus || '待补拍'),
+  }))) : '<span class="muted">暂无记录</span>';
+
+  const outEl = $('outputs');
+  outEl.innerHTML = '';
+  const labels = {
+    ship_profile_summary: '船舶检验档案摘要', base_checklist: '基础检查项',
+    priority_checklist: '重点检查项 / 风险提示 / 法规更新',
+    surveyor_preparation_report: '验船师登轮准备报告', owner_preparation_notice: '船东准备通知',
+    email_tracking_status: '船东通知邮件跟踪', inspection_item_execution_report: '检查项执行报告',
+    new_equipment_changes: '新增/变更设备（人工确认清单）', survey_memorandum: '检验备忘录',
+    certificate_report: '证书报告草稿', archive_status: '归档状态',
+  };
+  for (const [key, label] of Object.entries(labels)) {
+    const v = task.outputs[key];
+    if (v === undefined || v === null || (Array.isArray(v) && !v.length)) continue;
+    const h = document.createElement('h3');
+    h.style.fontSize = '13px'; h.style.margin = '12px 0 4px';
+    h.textContent = label;
+    const pre = document.createElement('pre');
+    pre.className = 'output';
+    pre.textContent = typeof v === 'string' ? v : JSON.stringify(v, null, 2);
+    outEl.appendChild(h); outEl.appendChild(pre);
+  }
+}
+
+function statusText(s) {
+  return { pending: '待执行', in_progress: '进行中', awaiting_confirm: '待人工确认',
+           attention: '有缺失需关注', done: '已完成', blocked: '已阻断' }[s] || s;
+}
+
+function tableOf(rows) {
+  const cols = Object.keys(rows[0]);
+  return '<table><tr>' + cols.map(c => `<th>${c}</th>`).join('') + '</tr>' +
+    rows.map(r => '<tr>' + cols.map(c => `<td>${r[c]}</td>`).join('') + '</tr>').join('') + '</table>';
+}
+
+async function confirmPoint(point) {
+  const data = await api(`/api/survey/tasks/${TASK.id}/confirm`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ point, confirmed: true }),
+  });
+  render(data.task);
+}
+
+$('create').onclick = async () => {
+  try {
+    const data = await api('/api/survey/tasks', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        ship_identifier: $('ship').value.trim(),
+        inspection_work_order: $('wo').value.trim() || undefined,
+        planned_boarding_time: $('boarding').value,
+        surveyor: $('surveyor').value.trim(),
+        branch: $('branch').value.trim(),
+      }),
+    });
+    await loadTasks(data.task.id);
+  } catch (e) { alert(e.message); }
+};
+
+$('advance').onclick = async () => {
+  const data = await api(`/api/survey/tasks/${TASK.id}/advance`, { method: 'POST' });
+  render(data.task);
+  if (data.blockedBy) $('blocked').textContent = '待确认后才能继续：' + data.blockedBy.join('、');
+};
+
+$('r-add').onclick = async () => {
+  const desc = $('r-desc').value.trim();
+  if (!desc) { alert('请填写问题描述'); return; }
+  const data = await api(`/api/survey/tasks/${TASK.id}/records`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      type: 'issue',
+      itemNo: $('r-item').value.trim() || null,
+      equipment: $('r-equip').value.trim(),
+      description: desc,
+      qualification: $('r-qual').value,
+      evidence: $('r-evi').checked ? ['photo://onboard-evidence'] : [],
+      newEquipment: $('r-new').checked ? '现场核实的设备变更' : null,
+    }),
+  });
+  $('r-desc').value = ''; $('r-item').value = ''; $('r-equip').value = '';
+  $('r-evi').checked = false; $('r-new').checked = false;
+  render(data.task);
+};
+
+$('tasksel').onchange = (e) => openTask(e.target.value);
+$('reload').onclick = () => loadTasks(TASK ? TASK.id : ($('tasksel').value || null));
+
+const params = new URLSearchParams(location.search);
+loadTasks(params.get('taskId'));
+</script>
+</body>
+</html>
