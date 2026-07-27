@@ -24,6 +24,7 @@ BUSINESS_ACTIONS: Dict[str, str] = {
     "CONFIRM_RECTIFICATION_ISSUES": "确认遗留问题已整改",
     "PENDING_RECTIFICATION_ISSUES": "标记遗留问题未整改",
     "COMPLETE_INSPECTION_TASK": "完成检验任务（收尾归档）",
+    "ANNUAL_SURVEY": "年度检验全流程：发起/推进营运船舶年度检验（ship-annual-survey Skill，harness 本地执行）",
     "GENERAL_QA": "通用问答：以上都不匹配时由主服务大模型自由回答",
 }
 
@@ -42,6 +43,7 @@ ACTION_NAMES = {
     "CONFIRM_RECTIFICATION_ISSUES": "确认整改遗留问题",
     "PENDING_RECTIFICATION_ISSUES": "未整改遗留问题",
     "COMPLETE_INSPECTION_TASK": "完成检验任务",
+    "ANNUAL_SURVEY": "年度检验全流程",
     "GENERAL_QA": "通用问答",
 }
 
@@ -60,6 +62,7 @@ ACTION_SAMPLE_CONTENT = {
     "CONFIRM_RECTIFICATION_ISSUES": "确认这些遗留问题已经整改",
     "PENDING_RECTIFICATION_ISSUES": "这些遗留问题标记为未整改",
     "COMPLETE_INSPECTION_TASK": "帮我完成检验任务",
+    "ANNUAL_SURVEY": "开始远洋之星的年度检验",
 }
 
 

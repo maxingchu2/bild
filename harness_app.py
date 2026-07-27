@@ -32,6 +32,7 @@ from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from langgraph.graph import END, START, StateGraph
 
+from harness_llm_1 import annual_survey
 from harness_llm_1 import harness as master_agent
 from harness_llm_1.plugins import plugin_manager
 
@@ -334,6 +335,63 @@ async def assistant_page():
     return FileResponse(os.path.join(STATIC_DIR, "assistant.html"))
 
 
+@app.get("/annual-survey")
+@app.get("/annual-survey.html")
+async def annual_survey_page():
+    return FileResponse(os.path.join(STATIC_DIR, "annual-survey.html"))
+
+
+# ==================== 年度检验（ship-annual-survey Skill） ====================
+@app.get("/api/survey/tasks")
+async def survey_tasks():
+    return JSONResponse({"tasks": annual_survey.list_tasks(),
+                         "stages": annual_survey.STAGES,
+                         "stageNames": annual_survey.STAGE_NAMES,
+                         "confirmPoints": annual_survey.CONFIRM_POINTS})
+
+
+@app.post("/api/survey/tasks")
+async def survey_create(request: Request):
+    data = await request.json()
+    if not (data.get("ship_identifier") or "").strip():
+        return JSONResponse({"error": "请提供船名、IMO 编号或检验工作号"},
+                            status_code=400)
+    task = annual_survey.create_task(data)
+    return JSONResponse({"task": task})
+
+
+@app.get("/api/survey/tasks/{task_id}")
+async def survey_get(task_id: str):
+    task = annual_survey.load_task(task_id)
+    if task is None:
+        return JSONResponse({"error": "任务不存在"}, status_code=404)
+    return JSONResponse({"task": task})
+
+
+@app.post("/api/survey/tasks/{task_id}/advance")
+async def survey_advance(task_id: str):
+    result = await annual_survey.advance_task(task_id)
+    status = 404 if result.get("error") else 200
+    return JSONResponse(result, status_code=status)
+
+
+@app.post("/api/survey/tasks/{task_id}/confirm")
+async def survey_confirm(task_id: str, request: Request):
+    data = await request.json()
+    result = annual_survey.confirm_point(
+        task_id, data.get("point", ""), bool(data.get("confirmed", True)))
+    status = 404 if result.get("error") else 200
+    return JSONResponse(result, status_code=status)
+
+
+@app.post("/api/survey/tasks/{task_id}/records")
+async def survey_record(task_id: str, request: Request):
+    data = await request.json()
+    result = annual_survey.add_onboard_record(task_id, data)
+    status = 404 if result.get("error") else 200
+    return JSONResponse(result, status_code=status)
+
+
 @app.get("/api/harness/state")
 async def harness_state():
     return JSONResponse({
@@ -482,6 +540,45 @@ async def harness_chat(request: Request):
                 params = dict(applied.get("actionParams") or {})
                 params.setdefault("shipName", decision["shipName"])
                 applied["actionParams"] = params
+    # 年度检验流程为 harness 本地 Skill，不转发主服务
+    if decision and decision["actionCode"] == "ANNUAL_SURVEY":
+        ship = decision.get("shipName") or ""
+        task = annual_survey.create_task({"ship_identifier": ship}) if ship else None
+        answer = (
+            f"已为「{ship}」创建年度检验任务（工作号 "
+            f"{task['input']['inspection_work_order']}），"
+            f"请打开 /annual-survey?taskId={task['id']} 推进流程。"
+            if task else
+            "要发起年度检验，请提供船名、IMO 编号或检验工作号；"
+            "也可以直接打开 /annual-survey 页面创建任务。")
+        HARNESS_STATE["interactions"].append({
+            "id": str(uuid.uuid4()),
+            "at": datetime.now().isoformat(),
+            "content": content_in,
+            "requestActionCode": None,
+            "overrideRule": None,
+            "decidedBy": decision.get("decidedBy"),
+            "decideReason": decision.get("reason"),
+            "confidence": decision.get("confidence"),
+            "actionCode": "ANNUAL_SURVEY",
+            "status": "success",
+        })
+        save_state()
+
+        async def local_reply() -> AsyncGenerator[bytes, None]:
+            data = json.dumps({"content": answer, "actionCode": "ANNUAL_SURVEY",
+                               "status": "success"}, ensure_ascii=False)
+            yield f"event: answer_delta\ndata: {data}\n\n".encode()
+            meta = json.dumps({
+                "actionCode": "ANNUAL_SURVEY",
+                "surveyTaskId": task["id"] if task else None,
+                "decidedBy": decision.get("decidedBy"),
+                "decideReason": decision.get("reason"),
+                "confidence": decision.get("confidence"),
+            }, ensure_ascii=False)
+            yield f"event: harness_meta\ndata: {meta}\n\n".encode()
+
+        return StreamingResponse(local_reply(), media_type="text/event-stream")
     if payload.get("fromRecommendation") or any(
         r.get("sampleContent") == content_in
         for r in HARNESS_STATE.get("recommendations", [])
