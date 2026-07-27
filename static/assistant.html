@@ -53,7 +53,7 @@ svg text{font-family:inherit}
 <body>
 <header>
   <h1>船检智能助手 · 智能驾驶舱</h1>
-  <span class="tag">自动优化：看数据 → 给建议 → 自动纠错</span>
+  <span class="tag">🧠 DeepSeek 主 Agent 控制 · 看数据 → 给建议 → 自动纠错</span>
   <span class="tag" id="mainBase"></span>
   <span style="flex:1"></span>
   <button class="small" onclick="toggleGuide()" style="border:0">❓ 这是什么？</button>
@@ -78,6 +78,10 @@ svg text{font-family:inherit}
     </div>
   </section>
   <aside>
+    <div class="side">
+      <h3>🧠 AI 大盘解读（由主 Agent 自动分析）</h3>
+      <div class="body" id="aiAnalysis"><span class="empty">等待 AI 分析…</span></div>
+    </div>
     <div class="side">
       <h3>📈 使用情况走势（每分钟的对话量）</h3>
       <div class="body" id="timeline"><span class="empty">暂无数据</span></div>
@@ -135,7 +139,8 @@ async function send(text,fromRec){
       if(!data)continue;
       let obj;try{obj=JSON.parse(data);}catch(e){continue;}
       if(ev==='harness_meta'){meta=obj;
-        if(obj.overrideRule){const r=bot.querySelector('.rulehit');r.style.display='inline-block';r.textContent='规则命中: '+obj.overrideRule;}
+        if(obj.decidedBy==='llm'){const r=bot.querySelector('.rulehit');r.style.display='inline-block';r.textContent='🧠 主Agent决策'+(obj.decideReason?'：'+obj.decideReason:'');}
+        else if(obj.overrideRule){const r=bot.querySelector('.rulehit');r.style.display='inline-block';r.textContent='规则命中: '+obj.overrideRule;}
         continue;}
       if(obj.actionCode&&!meta.actionCode){meta.actionCode=obj.actionCode;}
       if(obj.actionCode){const c=bot.querySelector('.code');c.style.display='inline-block';c.textContent=obj.actionCode+(ACTIONS[obj.actionCode]?' · '+ACTIONS[obj.actionCode]:'');}
@@ -203,6 +208,12 @@ async function refresh(){
     ['已学会的规则',an.ruleCount??0],
     ['建议采纳率',an.recStats&&an.recStats.adoptionRate!=null?(an.recStats.adoptionRate*100).toFixed(1)+'%':'-'],
   ].map(([l,v])=>`<div class="card"><div class="v">${v}</div><div class="l">${l}</div></div>`).join('');
+  const ai=an.aiAnalysis||{};
+  document.getElementById('aiAnalysis').innerHTML=ai.summary?`
+    <div style="font-size:12.5px;color:#334155;line-height:1.7"><b>${esc(ai.summary)}</b></div>
+    ${(ai.insights||[]).map(t=>`<div style="font-size:12px;color:#475569;margin-top:4px">· ${esc(t)}</div>`).join('')}
+    ${(ai.suggestions||[]).map(t=>`<div style="font-size:12px;color:#1d4ed8;margin-top:4px">💡 ${esc(t)}</div>`).join('')}`
+    :'<span class="empty">等待 AI 分析…</span>';
   document.getElementById('timeline').innerHTML=lineChart(an.timeline||[]);
   document.getElementById('dist').innerHTML=barChart(an.actionDistribution||[]);
   const rs=an.recStats||{};
@@ -220,7 +231,7 @@ async function refresh(){
     <div class="pnote" style="margin-top:4px">最近运行 ${run.at?.slice(0,19).replace('T',' ')} · 给出建议 ${run.recommendations} 条 · 新学会规则 ${run.newRules} 条</div>`
     :'<span class="empty">还没运行过，发一条消息或点右上角按钮试试</span>';
 
-  document.getElementById('rules').innerHTML=(st.overrideRules||[]).map(r=>`<div class="rule">听到「${esc(r.keyword)}」时 → 执行「${ACTIONS[r.actionCode]||r.actionCode}」<br><small style="color:#64748b">来自您的反馈 · ${r.createdAt?.slice(0,19).replace('T',' ')}</small></div>`).join('')||'<span class="empty">还没学到规则</span>';
+  document.getElementById('rules').innerHTML=((st.corrections||[]).map(c=>`<div class="rule">听到「${esc(c.utterance)}」时 → 执行「${ACTIONS[c.actionCode]||c.actionCode}」<br><small style="color:#64748b">主Agent记忆 · ${c.at?.slice(0,19).replace('T',' ')}</small></div>`).join(''))+((st.overrideRules||[]).map(r=>`<div class="rule">听到「${esc(r.keyword)}」时 → 执行「${ACTIONS[r.actionCode]||r.actionCode}」<br><small style="color:#64748b">来自您的反馈 · ${r.createdAt?.slice(0,19).replace('T',' ')}</small></div>`).join(''))||'<span class="empty">还没学到规则</span>';
   document.getElementById('recBar').innerHTML='<span style="font-size:12px;color:#64748b;align-self:center">💡 下一步建议：</span>'+((st.recommendations||[]).map(r=>`<button title="${r.reason}" onclick="send('${esc(r.sampleContent)}',true)">${r.actionName}</button>`).join('')||'<span class="empty" style="align-self:center">发一条消息后这里会出现建议</span>');
 }
 refresh();

@@ -32,6 +32,11 @@ from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from langgraph.graph import END, START, StateGraph
 
+from harness_llm_1 import harness as master_agent
+from harness_llm_1.plugins import plugin_manager
+
+plugin_manager.install_all()
+
 MAIN_BASE = os.getenv("HARNESS_MAIN_BASE", "http://127.0.0.1:8000")
 STATE_FILE = os.getenv("HARNESS_STATE_FILE", "harness_state.json")
 STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
@@ -336,6 +341,7 @@ async def harness_state():
         "metrics": HARNESS_STATE["metrics"],
         "recommendations": HARNESS_STATE["recommendations"],
         "overrideRules": HARNESS_STATE["override_rules"],
+        "corrections": master_agent.memory.corrections(),
         "optimizations": HARNESS_STATE["optimizations"][-10:],
         "lastOptimizedAt": HARNESS_STATE["last_optimized_at"],
         "recentInteractions": HARNESS_STATE["interactions"][-20:],
@@ -377,14 +383,35 @@ async def harness_analytics():
             "bySource": stats.get("bySource", {}),
         },
         "pipelineRuns": HARNESS_STATE.get("pipeline_runs", [])[-10:],
-        "ruleCount": len(HARNESS_STATE["override_rules"]),
+        "ruleCount": len(HARNESS_STATE["override_rules"]) + len(
+            master_agent.memory.corrections()),
         "feedbackCount": len(HARNESS_STATE["feedback"]),
+        "aiAnalysis": await master_agent.analyze_dashboard({
+            "actionDistribution": action_dist,
+            "statusDistribution": status_dist,
+            "recStats": stats,
+            "totalInteractions": len(interactions),
+            "corrections": len(master_agent.memory.corrections()),
+        }),
     })
 
 
 @app.post("/api/harness/optimize")
 async def harness_optimize():
-    return JSONResponse(run_pipeline())
+    result = run_pipeline()
+    # 推荐由主 agent（推荐子 agent）接管，规则推荐仅在 LLM 不可用时兜底
+    inter = HARNESS_STATE["interactions"]
+    last_action = next((i["actionCode"] for i in reversed(inter)
+                        if i.get("actionCode")), None)
+    llm_recs = await master_agent.recommend_next(last_action, inter)
+    if llm_recs:
+        for r in llm_recs:
+            r["reason"] = ("主agent推荐：" + r["reason"]
+                           if r.get("source") == "llm" else r["reason"])
+        HARNESS_STATE["recommendations"] = llm_recs
+        result["recommendations"] = llm_recs
+        save_state()
+    return JSONResponse(result)
 
 
 @app.post("/api/harness/feedback")
@@ -402,6 +429,9 @@ async def harness_feedback(request: Request):
     }
     HARNESS_STATE["feedback"].append(fb)
     save_state()
+    # 负反馈 → 写入主 agent 跨会话纠错记忆（下一轮 System Prompt 即生效）
+    if fb["rating"] == "down" and fb.get("expectedAction"):
+        master_agent.learn_from_feedback(fb["content"], fb["expectedAction"])
     # 负反馈立即触发一轮自动优化
     result = run_pipeline() if fb["rating"] == "down" else None
     return JSONResponse({"feedback": fb, "optimizeResult": result})
@@ -434,6 +464,24 @@ async def harness_chat(request: Request):
     rule_hit = applied.pop("_harnessRule", None)
     auth = request.headers.get("Authorization", "")
     content_in = payload.get("content", "") or ""
+    # 主 agent（DeepSeek）决策动作；覆盖规则/显式 actionCode 作为辅助快速通道
+    decision = None
+    if not applied.get("actionCode") and content_in:
+        inter = HARNESS_STATE["interactions"]
+        last_action = next((i["actionCode"] for i in reversed(inter)
+                            if i.get("actionCode")), None)
+        decision = await master_agent.decide_action(content_in, {
+            "pageCode": payload.get("pageCode"),
+            "sessionType": payload.get("sessionType"),
+            "lastAction": last_action,
+        })
+        if decision["actionCode"] != "GENERAL_QA":
+            applied = dict(applied)
+            applied["actionCode"] = decision["actionCode"]
+            if decision.get("shipName"):
+                params = dict(applied.get("actionParams") or {})
+                params.setdefault("shipName", decision["shipName"])
+                applied["actionParams"] = params
     if payload.get("fromRecommendation") or any(
         r.get("sampleContent") == content_in
         for r in HARNESS_STATE.get("recommendations", [])
@@ -446,6 +494,9 @@ async def harness_chat(request: Request):
         "content": payload.get("content", ""),
         "requestActionCode": payload.get("actionCode") or None,
         "overrideRule": rule_hit,
+        "decidedBy": (decision or {}).get("decidedBy"),
+        "decideReason": (decision or {}).get("reason"),
+        "confidence": (decision or {}).get("confidence"),
         "actionCode": None,
         "status": None,
     }
@@ -481,6 +532,9 @@ async def harness_chat(request: Request):
                 "interactionId": interaction["id"],
                 "actionCode": interaction["actionCode"],
                 "overrideRule": rule_hit,
+                "decidedBy": interaction["decidedBy"],
+                "decideReason": interaction["decideReason"],
+                "confidence": interaction["confidence"],
             }, ensure_ascii=False)
             yield f"event: harness_meta\ndata: {meta}\n\n".encode()
             HARNESS_STATE["interactions"].append(interaction)
