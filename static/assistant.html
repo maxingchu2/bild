@@ -52,16 +52,24 @@ svg text{font-family:inherit}
 </head>
 <body>
 <header>
-  <h1>船检智能体 Harness 控制台</h1>
-  <span class="tag">LangGraph: observe → recommend → optimize → apply</span>
+  <h1>船检智能助手 · 智能驾驶舱</h1>
+  <span class="tag">自动优化：看数据 → 给建议 → 自动纠错</span>
   <span class="tag" id="mainBase"></span>
   <span style="flex:1"></span>
-  <button class="small" onclick="optimize()" style="background:#1e40af;color:#fff;border:0">运行优化管线</button>
+  <button class="small" onclick="toggleGuide()" style="border:0">❓ 这是什么？</button>
+  <button class="small" onclick="optimize()" style="background:#1e40af;color:#fff;border:0">🔄 立即自动优化一次</button>
 </header>
+<div id="guide" style="margin:12px 14px 0;background:#eff6ff;border:1px solid #bfdbfe;border-radius:10px;padding:12px 16px;font-size:13px;line-height:1.9">
+  <b>这个页面是干什么的？</b>它是船检智能助手的“驾驶舱”，一边聊天干活，一边自动把助手越用越聪明：<br>
+  ① <b>左边聊天</b>：像平时一样输入指令（如“开始准备东海01船只任务”），助手会识别意图并执行；输入框上方会出现“下一步建议”按钮，点一下就能直接发送。<br>
+  ② <b>帮助它学习</b>：每条回答下方可以点“对 / 不对”。点“不对”并选择你本来想要的功能，助手会<b>自动记住</b>，下次再说同样的话就不会再错。<br>
+  ③ <b>右边看板</b>：实时统计使用情况、常用功能、建议的采纳效果，以及助手已经“学会”的纠错规则。
+  <a href="javascript:toggleGuide()" style="color:#1d4ed8">收起</a>
+</div>
 <div id="cards"></div>
 <main>
   <section class="panel">
-    <h2>对话（经 Harness 代理 → 主服务 /api/ai/chat/classify）</h2>
+    <h2>💬 和助手对话（输入指令，助手识别并执行）</h2>
     <div id="chat"></div>
     <div id="recBar"></div>
     <div id="inputBar">
@@ -71,24 +79,24 @@ svg text{font-family:inherit}
   </section>
   <aside>
     <div class="side">
-      <h3>交互趋势（分钟级，总量/成功/规则命中）</h3>
+      <h3>📈 使用情况走势（每分钟的对话量）</h3>
       <div class="body" id="timeline"><span class="empty">暂无数据</span></div>
     </div>
     <div class="side">
-      <h3>动作分布</h3>
+      <h3>🔥 最常用的功能排行</h3>
       <div class="body" id="dist"><span class="empty">暂无数据</span></div>
     </div>
     <div class="side">
-      <h3>推荐模块分析</h3>
+      <h3>💡 智能建议效果（建议了多少次、被采纳多少次）</h3>
       <div class="body" id="recAnalysis"><span class="empty">暂无数据</span></div>
     </div>
     <div class="side">
-      <h3>LangGraph 管线（最近一次运行）</h3>
-      <div class="body" id="pipelineBody"><span class="empty">尚未运行</span></div>
+      <h3>⚙️ 自动优化流水线（每轮对话后自动运行）</h3>
+      <div class="body" id="pipelineBody"><span class="empty">还没运行过，发一条消息或点右上角按钮试试</span></div>
     </div>
     <div class="side">
-      <h3>动态覆盖规则（自动优化生成）</h3>
-      <div class="body" id="rules"><span class="empty">暂无规则；对回答点「不对」并选期望动作，会自动生成</span></div>
+      <h3>🎓 助手已学会的纠错规则</h3>
+      <div class="body" id="rules"><span class="empty">还没学到规则。当助手理解错了，点回答下方的「不对」并选择正确功能，它就会自动记住</span></div>
     </div>
   </aside>
 </main>
@@ -99,6 +107,8 @@ const chat = document.getElementById('chat');
 const TASK_ID = 10001;
 function el(html){const d=document.createElement('div');d.innerHTML=html;return d.firstElementChild;}
 function scroll(){chat.scrollTop=chat.scrollHeight;}
+function toggleGuide(){const g=document.getElementById('guide');g.style.display=g.style.display==='none'?'block':'none';localStorage.setItem('guideHidden',g.style.display==='none'?'1':'');}
+if(localStorage.getItem('guideHidden'))document.getElementById('guide').style.display='none';
 function esc(s){return String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
 
 async function send(text,fromRec){
@@ -137,11 +147,11 @@ async function send(text,fromRec){
 }
 
 function addFeedback(bot,content,meta){
-  const fb=el(`<div class="fb"><span style="font-size:11px;color:#64748b">识别对吗？</span><button>对</button><button>不对</button><select style="display:none"><option value="">选择期望动作…</option>${Object.entries(ACTIONS).map(([k,v])=>`<option value="${k}">${v}</option>`).join('')}</select></div>`);
+  const fb=el(`<div class="fb"><span style="font-size:11px;color:#64748b">助手理解对了吗？</span><button>👍 对</button><button>👎 不对</button><select style="display:none"><option value="">告诉它你本来想要…</option>${Object.entries(ACTIONS).map(([k,v])=>`<option value="${k}">${v}</option>`).join('')}</select></div>`);
   const [ok,bad]=fb.querySelectorAll('button');const sel=fb.querySelector('select');
-  ok.onclick=async()=>{await postFB('up');fb.innerHTML='<span style="font-size:11px;color:#16a34a">已反馈 ✓</span>';refresh();};
+  ok.onclick=async()=>{await postFB('up');fb.innerHTML='<span style="font-size:11px;color:#16a34a">谢谢反馈 ✓</span>';refresh();};
   bad.onclick=()=>{sel.style.display='inline-block';};
-  sel.onchange=async()=>{if(!sel.value)return;await postFB('down',sel.value);fb.innerHTML='<span style="font-size:11px;color:#d97706">已反馈，自动优化已触发</span>';refresh();};
+  sel.onchange=async()=>{if(!sel.value)return;await postFB('down',sel.value);fb.innerHTML='<span style="font-size:11px;color:#d97706">已记住！下次再说同样的话会直接纠正 ✓</span>';refresh();};
   async function postFB(rating,expected){
     await fetch('/api/harness/feedback',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({interactionId:meta.interactionId,content,actionCode:meta.actionCode,expectedAction:expected,rating})});
   }
@@ -166,7 +176,7 @@ function lineChart(timeline){
     <path d="${path('success')}" fill="none" stroke="#16a34a" stroke-width="2" stroke-dasharray="4 3"/>
     <path d="${path('override')}" fill="none" stroke="#d97706" stroke-width="2" stroke-dasharray="2 3"/>
     ${labels}</svg>
-    <div class="legend"><span><span class="dot" style="background:#2563eb"></span>总交互</span><span><span class="dot" style="background:#16a34a"></span>成功</span><span><span class="dot" style="background:#d97706"></span>规则命中</span></div>`;
+    <div class="legend"><span><span class="dot" style="background:#2563eb"></span>对话总量</span><span><span class="dot" style="background:#16a34a"></span>成功完成</span><span><span class="dot" style="background:#d97706"></span>用到了纠错规则</span></div>`;
 }
 
 function barChart(dist){
@@ -186,12 +196,12 @@ async function refresh(){
   document.getElementById('mainBase').textContent='主服务 '+st.mainBase;
   const m=st.metrics||{};
   document.getElementById('cards').innerHTML=[
-    ['总交互数',m.totalInteractions??0],
-    ['成功率',m.successRate!=null?(m.successRate*100).toFixed(1)+'%':'-'],
-    ['未识别',m.unmatchedCount??0],
-    ['负反馈',an.feedbackCount??0],
-    ['覆盖规则',an.ruleCount??0],
-    ['推荐采纳率',an.recStats&&an.recStats.adoptionRate!=null?(an.recStats.adoptionRate*100).toFixed(1)+'%':'-'],
+    ['对话总数',m.totalInteractions??0],
+    ['成功完成率',m.successRate!=null?(m.successRate*100).toFixed(1)+'%':'-'],
+    ['没听懂的次数',m.unmatchedCount??0],
+    ['收到的反馈',an.feedbackCount??0],
+    ['已学会的规则',an.ruleCount??0],
+    ['建议采纳率',an.recStats&&an.recStats.adoptionRate!=null?(an.recStats.adoptionRate*100).toFixed(1)+'%':'-'],
   ].map(([l,v])=>`<div class="card"><div class="v">${v}</div><div class="l">${l}</div></div>`).join('');
   document.getElementById('timeline').innerHTML=lineChart(an.timeline||[]);
   document.getElementById('dist').innerHTML=barChart(an.actionDistribution||[]);
@@ -199,17 +209,19 @@ async function refresh(){
   const srcEntries=Object.entries(rs.bySource||{});
   const srcTotal=srcEntries.reduce((a,[,v])=>a+v,0)||1;
   document.getElementById('recAnalysis').innerHTML=`
-    <div style="font-size:12px;color:#475569">推荐展示 <b>${rs.shown||0}</b> 次 · 采纳 <b>${rs.adopted||0}</b> 次 · 采纳率 <b>${rs.adoptionRate!=null?(rs.adoptionRate*100).toFixed(1)+'%':'-'}</b></div>
+    <div style="font-size:12px;color:#475569">共给出 <b>${rs.shown||0}</b> 条建议 · 您采纳了 <b>${rs.adopted||0}</b> 条 · 采纳率 <b>${rs.adoptionRate!=null?(rs.adoptionRate*100).toFixed(1)+'%':'-'}</b></div>
     <div class="srcbar">${srcEntries.map(([k,v],i)=>`<div style="width:${(v/srcTotal*100).toFixed(1)}%;background:${COLORS[i%COLORS.length]}"></div>`).join('')||'<div style="width:100%;background:#f1f5f9"></div>'}</div>
     <div class="legend">${srcEntries.map(([k,v],i)=>`<span><span class="dot" style="background:${COLORS[i%COLORS.length]}"></span>${k} ${v}</span>`).join('')||'<span class="empty">暂无来源数据</span>'}</div>`;
   const run=(an.pipelineRuns||[]).slice(-1)[0];
+  const STEP_NAMES={'observe':'👀 看数据','recommend':'💡 给建议','optimize':'🔧 自动纠错','apply':'💾 保存生效'};
   document.getElementById('pipelineBody').innerHTML=run?`
-    <div id="pipeline">${['observe','recommend','optimize','apply'].map((n,i)=>`<div class="pnode done">${n}</div>${i<3?'<span class="arrow">→</span>':''}`).join('')}</div>
-    ${(run.notes||[]).map(n=>`<div class="pnote">· ${esc(n)}</div>`).join('')}
-    <div class="pnote" style="margin-top:4px">最近运行 ${run.at?.slice(0,19)} · 推荐 ${run.recommendations} 条 · 新规则 ${run.newRules} 条（共 ${an.pipelineRuns.length} 次记录）</div>`
-    :'<span class="empty">尚未运行</span>';
-  document.getElementById('rules').innerHTML=(st.overrideRules||[]).map(r=>`<div class="rule">「${esc(r.keyword)}」→ ${r.actionCode}<br><small style="color:#64748b">${r.source} · ${r.createdAt?.slice(0,19)}</small></div>`).join('')||'<span class="empty">暂无规则</span>';
-  document.getElementById('recBar').innerHTML=(st.recommendations||[]).map(r=>`<button title="${r.reason}" onclick="send('${esc(r.sampleContent)}',true)">▶ ${r.actionName}</button>`).join('')||'<span class="empty" style="align-self:center">发起对话后这里会出现推荐动作</span>';
+    <div id="pipeline">${Object.values(STEP_NAMES).map((n,i)=>`<div class="pnode done">${n}</div>${i<3?'<span class="arrow">→</span>':''}`).join('')}</div>
+    ${(run.notes||[]).map(n=>`<div class="pnote">· ${esc(n.replace('observe:','看数据：').replace('recommend:','给建议：').replace('optimize:','自动纠错：').replace('apply:','保存生效：'))}</div>`).join('')}
+    <div class="pnote" style="margin-top:4px">最近运行 ${run.at?.slice(0,19).replace('T',' ')} · 给出建议 ${run.recommendations} 条 · 新学会规则 ${run.newRules} 条</div>`
+    :'<span class="empty">还没运行过，发一条消息或点右上角按钮试试</span>';
+
+  document.getElementById('rules').innerHTML=(st.overrideRules||[]).map(r=>`<div class="rule">听到「${esc(r.keyword)}」时 → 执行「${ACTIONS[r.actionCode]||r.actionCode}」<br><small style="color:#64748b">来自您的反馈 · ${r.createdAt?.slice(0,19).replace('T',' ')}</small></div>`).join('')||'<span class="empty">还没学到规则</span>';
+  document.getElementById('recBar').innerHTML='<span style="font-size:12px;color:#64748b;align-self:center">💡 下一步建议：</span>'+((st.recommendations||[]).map(r=>`<button title="${r.reason}" onclick="send('${esc(r.sampleContent)}',true)">${r.actionName}</button>`).join('')||'<span class="empty" style="align-self:center">发一条消息后这里会出现建议</span>');
 }
 refresh();
 setInterval(refresh,15000);
