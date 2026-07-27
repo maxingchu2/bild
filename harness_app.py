@@ -641,6 +641,49 @@ async def harness_chat(request: Request):
     return StreamingResponse(relay(), media_type="text/event-stream")
 
 
+# 其余 /api/* 一律代理到主服务（/api/chat、/api/ships、/api/conversations 等），
+# 使 harness 单端口即可访问全部页面功能
+@app.api_route("/api/{rest:path}", methods=["GET", "POST", "PUT", "DELETE"])
+async def proxy_main(rest: str, request: Request):
+    url = f"/api/{rest}"
+    body = await request.body()
+    headers = {k: v for k, v in request.headers.items()
+               if k.lower() in ("authorization", "content-type", "accept")}
+
+    async def relay_stream() -> AsyncGenerator[bytes, None]:
+        try:
+            async with httpx.AsyncClient(base_url=MAIN_BASE, timeout=300) as client:
+                async with client.stream(
+                    request.method, url, params=request.query_params,
+                    content=body or None, headers=headers,
+                ) as resp:
+                    async for chunk in resp.aiter_bytes():
+                        yield chunk
+        except httpx.HTTPError as e:
+            err = json.dumps(
+                {"error": f"[harness] 主服务不可达（{MAIN_BASE}）: {e}，"
+                          "请先启动主服务（python main_multi_agent.py）"},
+                ensure_ascii=False)
+            yield f"data: {err}\n\ndata: [DONE]\n\n".encode()
+
+    if "text/event-stream" in request.headers.get("accept", "") or rest == "chat":
+        return StreamingResponse(relay_stream(), media_type="text/event-stream")
+    try:
+        async with httpx.AsyncClient(base_url=MAIN_BASE, timeout=60) as client:
+            resp = await client.request(
+                request.method, url, params=request.query_params,
+                content=body or None, headers=headers)
+        return JSONResponse(
+            resp.json() if resp.headers.get("content-type", "").startswith(
+                "application/json") else {"raw": resp.text},
+            status_code=resp.status_code)
+    except httpx.HTTPError as e:
+        return JSONResponse(
+            {"error": f"[harness] 主服务不可达（{MAIN_BASE}）: {e}，"
+                      "请先启动主服务（python main_multi_agent.py）"},
+            status_code=502)
+
+
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 
