@@ -1,0 +1,420 @@
+"""智能体 Harness 服务（LangGraph 辅助的观测→推荐→优化闭环）。
+
+独立于主服务运行，不修改主服务任何代码：
+  - 前端控制：提供 http://127.0.0.1:8144/assistant 静态页面，动态渲染指标、
+    推荐动作和优化记录（页面内容随 harness 状态实时变化）。
+  - 后端控制：所有对话经 harness 代理转发到主服务 /api/ai/chat/classify，
+    转发前应用「动态覆盖规则」（意图关键词→actionCode），实现不改主服务
+    代码的行为热调整。
+  - Agent 本体自动优化：LangGraph StateGraph 编排
+        observe（汇总交互与反馈指标）
+     -> recommend（基于动作转移统计与业务流程图生成下一步推荐）
+     -> optimize（依据负反馈自动生成/调整意图覆盖规则）
+     -> apply（落盘 harness_state.json，前端立即生效）
+
+运行:
+  python -m uvicorn harness_app:app --port 8144
+环境变量:
+  HARNESS_MAIN_BASE  主服务地址，默认 http://127.0.0.1:8000
+"""
+
+import json
+import os
+import re
+import uuid
+from datetime import datetime
+from typing import Any, AsyncGenerator, Dict, List, TypedDict
+
+import httpx
+from fastapi import FastAPI, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from langgraph.graph import END, START, StateGraph
+
+MAIN_BASE = os.getenv("HARNESS_MAIN_BASE", "http://127.0.0.1:8000")
+STATE_FILE = os.getenv("HARNESS_STATE_FILE", "harness_state.json")
+STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
+
+# 业务流程图：动作完成后推荐的后续动作（推荐引擎的先验）
+WORKFLOW_NEXT: Dict[str, List[str]] = {
+    "START_INSPECTION": ["ADD_CHECK_ITEM", "VIEW_CHECK_ITEMS_OVERVIEW", "GENERATE_PREPARATION_FORM"],
+    "BEGIN_TASK": ["GENERATE_PREPARATION_FORM", "ADD_CHECK_ITEM", "OPEN_UPLOAD_MATERIAL"],
+    "ADD_CHECK_ITEM": ["SAVE_CHECK_ITEMS", "VIEW_CHECK_ITEMS_OVERVIEW"],
+    "DELETE_CHECK_ITEM": ["SAVE_CHECK_ITEMS", "VIEW_CHECK_ITEMS_OVERVIEW"],
+    "SAVE_CHECK_ITEMS": ["VIEW_CHECK_ITEMS_OVERVIEW", "RECORD_ISSUE"],
+    "VIEW_CHECK_ITEMS_OVERVIEW": ["RECORD_ISSUE", "GENERATE_RA_REPORT"],
+    "GENERATE_PREPARATION_FORM": ["OPEN_UPLOAD_MATERIAL", "START_INSPECTION"],
+    "GENERATE_RA_REPORT": ["GENERATE_WORK_LOG", "COMPLETE_INSPECTION_TASK"],
+    "OPEN_UPLOAD_MATERIAL": ["GENERATE_RA_REPORT", "GENERATE_WORK_LOG"],
+    "GENERATE_WORK_LOG": ["COMPLETE_INSPECTION_TASK"],
+    "RECORD_ISSUE": ["CONFIRM_RECTIFICATION_ISSUES", "PENDING_RECTIFICATION_ISSUES", "VIEW_CHECK_ITEMS_OVERVIEW"],
+    "CONFIRM_RECTIFICATION_ISSUES": ["COMPLETE_INSPECTION_TASK", "VIEW_CHECK_ITEMS_OVERVIEW"],
+    "PENDING_RECTIFICATION_ISSUES": ["RECORD_ISSUE", "CONFIRM_RECTIFICATION_ISSUES"],
+    "COMPLETE_INSPECTION_TASK": ["GENERATE_WORK_LOG"],
+}
+
+ACTION_NAMES = {
+    "BEGIN_TASK": "船只任务准备",
+    "START_INSPECTION": "开始检验",
+    "ADD_CHECK_ITEM": "新增检查项",
+    "DELETE_CHECK_ITEM": "删除检查项",
+    "SAVE_CHECK_ITEMS": "保存检查项",
+    "VIEW_CHECK_ITEMS_OVERVIEW": "查看检查项概览",
+    "GENERATE_PREPARATION_FORM": "生成开检准备单",
+    "GENERATE_RA_REPORT": "生成RA报告",
+    "OPEN_UPLOAD_MATERIAL": "上传资料",
+    "GENERATE_WORK_LOG": "生成工作日志",
+    "RECORD_ISSUE": "问题记录",
+    "CONFIRM_RECTIFICATION_ISSUES": "确认整改遗留问题",
+    "PENDING_RECTIFICATION_ISSUES": "未整改遗留问题",
+    "COMPLETE_INSPECTION_TASK": "完成检验任务",
+}
+
+ACTION_SAMPLE_CONTENT = {
+    "BEGIN_TASK": "开始准备东海01船只任务",
+    "START_INSPECTION": "开始检验",
+    "ADD_CHECK_ITEM": "新增检查项：编号A-101，名称救生设备检查",
+    "DELETE_CHECK_ITEM": "删除检查项A-101",
+    "SAVE_CHECK_ITEMS": "保存检查项",
+    "VIEW_CHECK_ITEMS_OVERVIEW": "查看检查项概览",
+    "GENERATE_PREPARATION_FORM": "生成开检准备单",
+    "GENERATE_RA_REPORT": "生成RA报告",
+    "OPEN_UPLOAD_MATERIAL": "上传资料",
+    "GENERATE_WORK_LOG": "生成工作日志",
+    "RECORD_ISSUE": "发现船体外板存在裂纹，严重程度高",
+    "CONFIRM_RECTIFICATION_ISSUES": "确认这些遗留问题已经整改",
+    "PENDING_RECTIFICATION_ISSUES": "这些遗留问题标记为未整改",
+    "COMPLETE_INSPECTION_TASK": "帮我完成检验任务",
+}
+
+
+# ==================== Harness 持久状态 ====================
+def default_state() -> Dict[str, Any]:
+    return {
+        "interactions": [],       # 交互记录
+        "feedback": [],           # 用户反馈
+        "override_rules": [],     # 动态意图覆盖规则 [{keyword, actionCode, source, createdAt}]
+        "metrics": {},            # observe 输出
+        "recommendations": [],    # recommend 输出
+        "optimizations": [],      # optimize 历史
+        "last_optimized_at": None,
+    }
+
+
+def load_state() -> Dict[str, Any]:
+    if os.path.exists(STATE_FILE):
+        try:
+            with open(STATE_FILE, encoding="utf-8") as f:
+                data = json.load(f)
+            base = default_state()
+            base.update(data if isinstance(data, dict) else {})
+            return base
+        except (json.JSONDecodeError, OSError):
+            pass
+    return default_state()
+
+
+def save_state() -> None:
+    with open(STATE_FILE, "w", encoding="utf-8") as f:
+        json.dump(HARNESS_STATE, f, ensure_ascii=False, indent=2)
+
+
+HARNESS_STATE = load_state()
+
+
+# ==================== LangGraph 优化管线 ====================
+class HarnessGraphState(TypedDict, total=False):
+    interactions: List[Dict[str, Any]]
+    feedback: List[Dict[str, Any]]
+    override_rules: List[Dict[str, Any]]
+    metrics: Dict[str, Any]
+    recommendations: List[Dict[str, Any]]
+    new_rules: List[Dict[str, Any]]
+    notes: List[str]
+
+
+def node_observe(state: HarnessGraphState) -> HarnessGraphState:
+    """观测：汇总交互与反馈，形成指标"""
+    interactions = state.get("interactions", [])
+    feedback = state.get("feedback", [])
+    total = len(interactions)
+    action_counts: Dict[str, int] = {}
+    success = 0
+    for it in interactions:
+        code = it.get("actionCode") or "UNMATCHED"
+        action_counts[code] = action_counts.get(code, 0) + 1
+        if it.get("status") == "success":
+            success += 1
+    negative = [fb for fb in feedback if fb.get("rating") == "down"]
+    metrics = {
+        "totalInteractions": total,
+        "successRate": round(success / total, 3) if total else None,
+        "actionCounts": action_counts,
+        "negativeFeedback": len(negative),
+        "unmatchedCount": action_counts.get("UNMATCHED", 0),
+        "observedAt": datetime.now().isoformat(),
+    }
+    notes = state.get("notes", []) + [f"observe: {total}次交互, {len(negative)}条负反馈"]
+    return {"metrics": metrics, "notes": notes}
+
+
+def node_recommend(state: HarnessGraphState) -> HarnessGraphState:
+    """推荐：业务流程先验 + 实际动作转移统计，给出下一步动作推荐"""
+    interactions = state.get("interactions", [])
+    transitions: Dict[str, Dict[str, int]] = {}
+    prev = None
+    for it in interactions:
+        code = it.get("actionCode")
+        if prev and code and prev != code:
+            transitions.setdefault(prev, {})
+            transitions[prev][code] = transitions[prev].get(code, 0) + 1
+        if code:
+            prev = code
+    last_action = next(
+        (it.get("actionCode") for it in reversed(interactions) if it.get("actionCode")),
+        None,
+    )
+    candidates: List[str] = []
+    if last_action:
+        learned = sorted(
+            transitions.get(last_action, {}).items(), key=lambda x: -x[1])
+        candidates += [a for a, _ in learned]
+        candidates += WORKFLOW_NEXT.get(last_action, [])
+    else:
+        candidates += ["START_INSPECTION", "BEGIN_TASK", "VIEW_CHECK_ITEMS_OVERVIEW"]
+    seen, recs = set(), []
+    for code in candidates:
+        if code in seen or code not in ACTION_NAMES:
+            continue
+        seen.add(code)
+        recs.append({
+            "actionCode": code,
+            "actionName": ACTION_NAMES[code],
+            "sampleContent": ACTION_SAMPLE_CONTENT.get(code, ""),
+            "reason": ("基于历史动作转移统计" if code in transitions.get(last_action or "", {})
+                       else "基于船检业务流程"),
+        })
+        if len(recs) >= 4:
+            break
+    notes = state.get("notes", []) + [f"recommend: 基于last_action={last_action} 生成{len(recs)}条推荐"]
+    return {"recommendations": recs, "notes": notes}
+
+
+def _extract_keyword(text: str) -> str:
+    text = (text or "").strip()
+    text = re.sub(r"[，。！？,.!?\s]+$", "", text)
+    return text[:24]
+
+
+def node_optimize(state: HarnessGraphState) -> HarnessGraphState:
+    """优化：依据负反馈自动生成意图覆盖规则（agent 行为自动修正）"""
+    feedback = state.get("feedback", [])
+    rules = list(state.get("override_rules", []))
+    existing = {(r["keyword"], r["actionCode"]) for r in rules}
+    new_rules: List[Dict[str, Any]] = []
+    for fb in feedback:
+        if fb.get("rating") != "down" or fb.get("applied"):
+            continue
+        expected = fb.get("expectedAction")
+        keyword = _extract_keyword(fb.get("content", ""))
+        if not expected or not keyword or expected not in ACTION_NAMES:
+            continue
+        if (keyword, expected) in existing:
+            fb["applied"] = True
+            continue
+        rule = {
+            "keyword": keyword,
+            "actionCode": expected,
+            "source": "auto_optimize",
+            "fromFeedback": fb.get("id"),
+            "createdAt": datetime.now().isoformat(),
+        }
+        rules.append(rule)
+        new_rules.append(rule)
+        existing.add((keyword, expected))
+        fb["applied"] = True
+    notes = state.get("notes", []) + [f"optimize: 新增{len(new_rules)}条覆盖规则"]
+    return {"override_rules": rules, "new_rules": new_rules,
+            "feedback": feedback, "notes": notes}
+
+
+def node_apply(state: HarnessGraphState) -> HarnessGraphState:
+    """应用：把优化结果写回 harness 持久状态"""
+    HARNESS_STATE["metrics"] = state.get("metrics", {})
+    HARNESS_STATE["recommendations"] = state.get("recommendations", [])
+    HARNESS_STATE["override_rules"] = state.get("override_rules", [])
+    HARNESS_STATE["feedback"] = state.get("feedback", HARNESS_STATE["feedback"])
+    if state.get("new_rules"):
+        HARNESS_STATE["optimizations"].append({
+            "at": datetime.now().isoformat(),
+            "newRules": state["new_rules"],
+            "notes": state.get("notes", []),
+        })
+    HARNESS_STATE["last_optimized_at"] = datetime.now().isoformat()
+    save_state()
+    return {"notes": state.get("notes", []) + ["apply: 状态已落盘"]}
+
+
+def build_graph():
+    g = StateGraph(HarnessGraphState)
+    g.add_node("observe", node_observe)
+    g.add_node("recommend", node_recommend)
+    g.add_node("optimize", node_optimize)
+    g.add_node("apply", node_apply)
+    g.add_edge(START, "observe")
+    g.add_edge("observe", "recommend")
+    g.add_edge("recommend", "optimize")
+    g.add_edge("optimize", "apply")
+    g.add_edge("apply", END)
+    return g.compile()
+
+
+HARNESS_GRAPH = build_graph()
+
+
+def run_pipeline() -> Dict[str, Any]:
+    result = HARNESS_GRAPH.invoke({
+        "interactions": HARNESS_STATE["interactions"],
+        "feedback": HARNESS_STATE["feedback"],
+        "override_rules": HARNESS_STATE["override_rules"],
+        "notes": [],
+    })
+    return {
+        "metrics": result.get("metrics", {}),
+        "recommendations": result.get("recommendations", []),
+        "newRules": result.get("new_rules", []),
+        "overrideRules": HARNESS_STATE["override_rules"],
+        "pipelineNotes": result.get("notes", []),
+    }
+
+
+# ==================== FastAPI 应用 ====================
+app = FastAPI(title="Agent Harness", version="0.1.0")
+app.add_middleware(
+    CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"],
+)
+
+
+@app.get("/assistant")
+async def assistant_page():
+    return FileResponse(os.path.join(STATIC_DIR, "assistant.html"))
+
+
+@app.get("/api/harness/state")
+async def harness_state():
+    return JSONResponse({
+        "mainBase": MAIN_BASE,
+        "metrics": HARNESS_STATE["metrics"],
+        "recommendations": HARNESS_STATE["recommendations"],
+        "overrideRules": HARNESS_STATE["override_rules"],
+        "optimizations": HARNESS_STATE["optimizations"][-10:],
+        "lastOptimizedAt": HARNESS_STATE["last_optimized_at"],
+        "recentInteractions": HARNESS_STATE["interactions"][-20:],
+    })
+
+
+@app.post("/api/harness/optimize")
+async def harness_optimize():
+    return JSONResponse(run_pipeline())
+
+
+@app.post("/api/harness/feedback")
+async def harness_feedback(request: Request):
+    data = await request.json()
+    fb = {
+        "id": str(uuid.uuid4()),
+        "interactionId": data.get("interactionId"),
+        "content": data.get("content", ""),
+        "actionCode": data.get("actionCode"),
+        "expectedAction": data.get("expectedAction"),
+        "rating": data.get("rating", "down"),
+        "applied": False,
+        "at": datetime.now().isoformat(),
+    }
+    HARNESS_STATE["feedback"].append(fb)
+    save_state()
+    # 负反馈立即触发一轮自动优化
+    result = run_pipeline() if fb["rating"] == "down" else None
+    return JSONResponse({"feedback": fb, "optimizeResult": result})
+
+
+def apply_override_rules(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """转发前应用动态覆盖规则：命中关键词则显式指定 actionCode"""
+    if payload.get("actionCode"):
+        return payload
+    content = payload.get("content", "") or ""
+    for rule in HARNESS_STATE["override_rules"]:
+        if rule["keyword"] and rule["keyword"] in content:
+            payload = dict(payload)
+            payload["actionCode"] = rule["actionCode"]
+            payload["_harnessRule"] = rule["keyword"]
+            break
+    return payload
+
+
+@app.post("/api/harness/chat")
+async def harness_chat(request: Request):
+    raw = await request.body()
+    try:
+        payload = json.loads(raw) if raw else {}
+    except (json.JSONDecodeError, ValueError):
+        payload = {}
+    if not isinstance(payload, dict):
+        payload = {}
+    applied = apply_override_rules(payload)
+    rule_hit = applied.pop("_harnessRule", None)
+    auth = request.headers.get("Authorization", "")
+    interaction = {
+        "id": str(uuid.uuid4()),
+        "at": datetime.now().isoformat(),
+        "content": payload.get("content", ""),
+        "requestActionCode": payload.get("actionCode") or None,
+        "overrideRule": rule_hit,
+        "actionCode": None,
+        "status": None,
+    }
+
+    async def relay() -> AsyncGenerator[bytes, None]:
+        headers = {"Content-Type": "application/json", "Accept": "text/event-stream"}
+        if auth:
+            headers["Authorization"] = auth
+        try:
+            async with httpx.AsyncClient(base_url=MAIN_BASE, timeout=180) as client:
+                async with client.stream(
+                    "POST", "/api/ai/chat/classify", json=applied, headers=headers
+                ) as resp:
+                    async for chunk in resp.aiter_bytes():
+                        text = chunk.decode("utf-8", errors="ignore")
+                        if interaction["actionCode"] is None:
+                            m = re.search(r'"actionCode"\s*:\s*"([A-Z_]+)"', text)
+                            if m:
+                                interaction["actionCode"] = m.group(1)
+                        if interaction["status"] is None:
+                            m = re.search(r'"status"\s*:\s*"(success|rejected|failed)"', text)
+                            if m:
+                                interaction["status"] = m.group(1)
+                        yield chunk
+        except httpx.HTTPError as e:
+            err = json.dumps(
+                {"content": f"[harness] 主服务不可达（{MAIN_BASE}）: {e}"},
+                ensure_ascii=False)
+            interaction["status"] = "failed"
+            yield f"event: answer_delta\ndata: {err}\n\n".encode()
+        finally:
+            meta = json.dumps({
+                "interactionId": interaction["id"],
+                "actionCode": interaction["actionCode"],
+                "overrideRule": rule_hit,
+            }, ensure_ascii=False)
+            yield f"event: harness_meta\ndata: {meta}\n\n".encode()
+            HARNESS_STATE["interactions"].append(interaction)
+            HARNESS_STATE["interactions"] = HARNESS_STATE["interactions"][-500:]
+            save_state()
+
+    return StreamingResponse(relay(), media_type="text/event-stream")
+
+
+if __name__ == "__main__":
+    import uvicorn
+
+    uvicorn.run(app, host="0.0.0.0", port=8144)

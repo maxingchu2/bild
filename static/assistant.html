@@ -1,0 +1,155 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>船检智能体 Harness 控制台</title>
+<style>
+:root{--primary:#2563eb;--bg:#f1f5f9;--card:#fff;--border:#e2e8f0;--text:#1e293b;--muted:#64748b;--ok:#16a34a;--warn:#d97706;--bad:#dc2626}
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:"PingFang SC","Microsoft YaHei",sans-serif;background:var(--bg);color:var(--text);height:100vh;display:flex;flex-direction:column}
+header{background:#0f172a;color:#fff;padding:12px 20px;display:flex;align-items:center;gap:12px}
+header h1{font-size:16px;font-weight:600}
+header .tag{font-size:12px;background:#1e40af;border-radius:10px;padding:2px 10px}
+main{flex:1;display:grid;grid-template-columns:1fr 360px;gap:14px;padding:14px;overflow:hidden}
+.panel{background:var(--card);border:1px solid var(--border);border-radius:10px;display:flex;flex-direction:column;overflow:hidden}
+.panel h2{font-size:13px;color:var(--muted);padding:10px 14px;border-bottom:1px solid var(--border);display:flex;justify-content:space-between;align-items:center}
+#chat{flex:1;overflow-y:auto;padding:14px;display:flex;flex-direction:column;gap:10px}
+.msg{max-width:78%;padding:9px 13px;border-radius:10px;font-size:14px;line-height:1.6;white-space:pre-wrap}
+.msg.user{align-self:flex-end;background:var(--primary);color:#fff}
+.msg.bot{align-self:flex-start;background:#f1f5f9;border:1px solid var(--border)}
+.msg .code{display:inline-block;font-size:11px;background:#dbeafe;color:#1d4ed8;border-radius:6px;padding:1px 8px;margin-bottom:5px}
+.msg .fb{margin-top:6px;display:flex;gap:6px;align-items:center}
+.msg .fb button{font-size:11px;border:1px solid var(--border);background:#fff;border-radius:6px;padding:2px 8px;cursor:pointer}
+.msg .fb select{font-size:11px;padding:2px}
+#inputBar{display:flex;gap:8px;padding:10px 14px;border-top:1px solid var(--border)}
+#inputBar input{flex:1;border:1px solid var(--border);border-radius:8px;padding:9px 12px;font-size:14px;outline:none}
+#inputBar button{background:var(--primary);color:#fff;border:0;border-radius:8px;padding:0 18px;font-size:14px;cursor:pointer}
+aside{display:flex;flex-direction:column;gap:14px;overflow-y:auto}
+.side{background:var(--card);border:1px solid var(--border);border-radius:10px}
+.side h3{font-size:13px;color:var(--muted);padding:9px 12px;border-bottom:1px solid var(--border);display:flex;justify-content:space-between;align-items:center}
+.side .body{padding:10px 12px;font-size:13px}
+.rec{display:block;width:100%;text-align:left;border:1px solid var(--border);background:#f8fafc;border-radius:8px;padding:7px 10px;margin-bottom:6px;cursor:pointer;font-size:13px}
+.rec:hover{border-color:var(--primary);background:#eff6ff}
+.rec small{display:block;color:var(--muted);font-size:11px}
+.metric{display:flex;justify-content:space-between;padding:3px 0;font-size:13px}
+.metric b{color:var(--primary)}
+.rule{font-size:12px;border-left:3px solid var(--ok);background:#f0fdf4;padding:5px 8px;border-radius:0 6px 6px 0;margin-bottom:5px}
+.opt{font-size:12px;color:var(--muted);margin-bottom:4px}
+button.small{font-size:12px;border:1px solid var(--border);background:#fff;border-radius:6px;padding:2px 10px;cursor:pointer}
+.empty{color:var(--muted);font-size:12px}
+</style>
+</head>
+<body>
+<header>
+  <h1>船检智能体 Harness 控制台</h1>
+  <span class="tag">LangGraph 观测→推荐→优化</span>
+  <span class="tag" id="mainBase"></span>
+</header>
+<main>
+  <section class="panel">
+    <h2>对话（经 Harness 代理转发主服务）</h2>
+    <div id="chat"></div>
+    <div id="inputBar">
+      <input id="input" placeholder="例如：开始准备东海01船只任务 / 发现船体外板存在裂纹，严重程度高" onkeydown="if(event.key==='Enter')send()">
+      <button onclick="send()">发送</button>
+    </div>
+  </section>
+  <aside>
+    <div class="side">
+      <h3>推荐下一步动作 <button class="small" onclick="optimize()">运行优化管线</button></h3>
+      <div class="body" id="recs"><span class="empty">暂无推荐，先发起对话或点击「运行优化管线」</span></div>
+    </div>
+    <div class="side">
+      <h3>运行指标（observe）</h3>
+      <div class="body" id="metrics"><span class="empty">暂无数据</span></div>
+    </div>
+    <div class="side">
+      <h3>动态覆盖规则（optimize 自动生成）</h3>
+      <div class="body" id="rules"><span class="empty">暂无规则；对回答点「不对」并选期望动作，会自动生成规则</span></div>
+    </div>
+    <div class="side">
+      <h3>优化记录</h3>
+      <div class="body" id="opts"><span class="empty">暂无</span></div>
+    </div>
+  </aside>
+</main>
+<script>
+const ACTIONS = {"BEGIN_TASK":"船只任务准备","START_INSPECTION":"开始检验","ADD_CHECK_ITEM":"新增检查项","DELETE_CHECK_ITEM":"删除检查项","SAVE_CHECK_ITEMS":"保存检查项","VIEW_CHECK_ITEMS_OVERVIEW":"查看检查项概览","GENERATE_PREPARATION_FORM":"生成开检准备单","GENERATE_RA_REPORT":"生成RA报告","OPEN_UPLOAD_MATERIAL":"上传资料","GENERATE_WORK_LOG":"生成工作日志","RECORD_ISSUE":"问题记录","CONFIRM_RECTIFICATION_ISSUES":"确认整改遗留问题","PENDING_RECTIFICATION_ISSUES":"未整改遗留问题","COMPLETE_INSPECTION_TASK":"完成检验任务"};
+const chat = document.getElementById('chat');
+const TASK_ID = 10001;
+
+function el(html){const d=document.createElement('div');d.innerHTML=html;return d.firstElementChild;}
+function scroll(){chat.scrollTop=chat.scrollHeight;}
+
+async function send(text){
+  const input=document.getElementById('input');
+  const content=(text||input.value).trim();
+  if(!content)return;
+  input.value='';
+  chat.appendChild(el(`<div class="msg user">${esc(content)}</div>`));
+  const bot=el(`<div class="msg bot"><span class="code" style="display:none"></span><span class="txt"></span></div>`);
+  chat.appendChild(bot);scroll();
+  const resp=await fetch('/api/harness/chat',{method:'POST',headers:{'Content-Type':'application/json','Accept':'text/event-stream'},body:JSON.stringify({taskId:TASK_ID,clientType:'pc',pageCode:'preparation',sessionType:'operation',content,actionParams:{}})});
+  const reader=resp.body.getReader();const dec=new TextDecoder();let buf='';let meta={};
+  while(true){
+    const {done,value}=await reader.read();if(done)break;
+    buf+=dec.decode(value,{stream:true});
+    let idx;
+    while((idx=buf.indexOf('\n\n'))>=0){
+      const block=buf.slice(0,idx);buf=buf.slice(idx+2);
+      let ev='message',data='';
+      for(const line of block.split('\n')){
+        if(line.startsWith('event:'))ev=line.slice(6).trim();
+        else if(line.startsWith('data:'))data+=line.slice(5).trim();
+      }
+      if(!data)continue;
+      let obj;try{obj=JSON.parse(data);}catch(e){continue;}
+      if(ev==='harness_meta'){meta=obj;continue;}
+      if(obj.actionCode&&!meta.actionCode){meta.actionCode=obj.actionCode;}
+      if(obj.actionCode){const c=bot.querySelector('.code');c.style.display='inline-block';c.textContent=obj.actionCode+(ACTIONS[obj.actionCode]?' · '+ACTIONS[obj.actionCode]:'');}
+      if(typeof obj.content==='string'&&obj.content&&obj.content!=='[DONE]'){bot.querySelector('.txt').textContent+=obj.content;scroll();}
+    }
+  }
+  addFeedback(bot,content,meta);
+  refresh();
+}
+
+function addFeedback(bot,content,meta){
+  const fb=el(`<div class="fb"><span style="font-size:11px;color:#64748b">识别对吗？</span><button>对</button><button>不对</button><select style="display:none"><option value="">选择期望动作…</option>${Object.entries(ACTIONS).map(([k,v])=>`<option value="${k}">${v}</option>`).join('')}</select></div>`);
+  const [ok,bad]=fb.querySelectorAll('button');const sel=fb.querySelector('select');
+  ok.onclick=async()=>{await postFB('up');fb.innerHTML='<span style="font-size:11px;color:#16a34a">已反馈 ✓</span>';};
+  bad.onclick=()=>{sel.style.display='inline-block';};
+  sel.onchange=async()=>{if(!sel.value)return;await postFB('down',sel.value);fb.innerHTML='<span style="font-size:11px;color:#d97706">已反馈，自动优化已触发</span>';refresh();};
+  async function postFB(rating,expected){
+    await fetch('/api/harness/feedback',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({interactionId:meta.interactionId,content,actionCode:meta.actionCode,expectedAction:expected,rating})});
+  }
+  bot.appendChild(fb);scroll();
+}
+
+async function optimize(){
+  await fetch('/api/harness/optimize',{method:'POST'});
+  refresh();
+}
+
+async function refresh(){
+  const st=await (await fetch('/api/harness/state')).json();
+  document.getElementById('mainBase').textContent='主服务 '+st.mainBase;
+  const recs=document.getElementById('recs');
+  recs.innerHTML=(st.recommendations||[]).map(r=>`<button class="rec" onclick="send('${esc(r.sampleContent)}')"><b>${r.actionName}</b>（${r.actionCode}）<small>${r.reason} · 点击试发：${esc(r.sampleContent)}</small></button>`).join('')||'<span class="empty">暂无推荐</span>';
+  const m=st.metrics||{};
+  document.getElementById('metrics').innerHTML=Object.keys(m).length?`
+    <div class="metric"><span>总交互数</span><b>${m.totalInteractions??'-'}</b></div>
+    <div class="metric"><span>成功率</span><b>${m.successRate!=null?(m.successRate*100).toFixed(1)+'%':'-'}</b></div>
+    <div class="metric"><span>未识别次数</span><b>${m.unmatchedCount??'-'}</b></div>
+    <div class="metric"><span>负反馈数</span><b>${m.negativeFeedback??'-'}</b></div>
+    <div class="metric"><span>动作分布</span><b style="font-size:11px">${Object.entries(m.actionCounts||{}).map(([k,v])=>k+':'+v).join(' ')||'-'}</b></div>`:'<span class="empty">暂无数据</span>';
+  document.getElementById('rules').innerHTML=(st.overrideRules||[]).map(r=>`<div class="rule">「${esc(r.keyword)}」→ ${r.actionCode}<br><small style="color:#64748b">${r.source} · ${r.createdAt?.slice(0,19)}</small></div>`).join('')||'<span class="empty">暂无规则</span>';
+  document.getElementById('opts').innerHTML=(st.optimizations||[]).map(o=>`<div class="opt">${o.at?.slice(0,19)} 新增 ${o.newRules.length} 条规则</div>`).join('')||'<span class="empty">暂无</span>';
+}
+
+function esc(s){return String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
+refresh();
+</script>
+</body>
+</html>
